@@ -45,6 +45,9 @@ REGEX_PATTERNS: dict[str, re.Pattern] = {
     "date_generic": re.compile(r"\b\d{1,2}/\d{1,2}/\d{2,4}\b"),
     "money": re.compile(r"\b[\d.,]+\s?(?:VND|đồng|VNĐ)\b", re.IGNORECASE),
     "percentage": re.compile(r"\b\d{1,3}\s?%"),
+    "credential": re.compile(
+        r"(?i)\b(?:password|mật khẩu|api[_\s-]?key|token|secret|otp)\b\s*[:=]\s*[^\s,;]+"
+    ),
 }
 
 # ── Builtin flags for regex-detected entity types ─────────────────────────────
@@ -62,6 +65,7 @@ _BUILTIN_ENTITY_FLAGS: dict[str, list[str]] = {
     "money":            ["has_financial"],
     "percentage":       ["has_financial"],
     "date_generic":     [],
+    "credential":       ["has_credential"],
 }
 
 # Keyword-based augmentation: catches in-text patterns GLiNER might miss
@@ -304,6 +308,8 @@ def extract_realtime_batch_detailed(
             except Exception as exc:
                 logger.debug("GLiNER detailed extraction failed: %s", exc)
         entities = structured + freetext
+        for entity in entities:
+            entity["flags"] = list(entity_flags.get(entity.get("label"), []))
         labels = detect_boolean_labels(text, entities, entity_flags)
         results.append({
             "entities": entities,
