@@ -442,7 +442,7 @@ class ChatService:
             if start < 0 or end <= start or end > len(text):
                 continue
             label = str(entity.get("label") or "").lower()
-            flags = builtin_flags.get(label, set())
+            flags = set(entity.get("flags") or builtin_flags.get(label, set()))
             matches = []
             for rule in field_rules:
                 targets = {str(v).lower() for v in (rule.get("target_entity_types") or [])}
