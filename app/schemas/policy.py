@@ -40,6 +40,11 @@ class RuleConditions(BaseModel):
     cross_dept_only: bool = False                   # Activated when the document is at a higher organizational level than the user.
     applicable_intents: list[str] = []              # Leave blank = all intents.
     min_user_level: Optional[int] = None
+    # Field/entity scope.  Empty means the rule keeps the legacy chunk-wide behaviour.
+    target_entity_types: list[str] = []              # e.g. money, email, person_name.
+    target_flags: list[str] = []                    # e.g. has_financial, has_pii.
+    # Concrete organisation-unit-instance IDs.  Empty means all departments.
+    applicable_oui_ids: list[str] = []
 
 
 class RuleContract(BaseModel):
@@ -112,6 +117,11 @@ class DomainRuleRead(BaseModel):
     updated_at: datetime
 
 
+class InstallRuleTemplatesRequest(BaseModel):
+    template_codes: list[str] = []  # Empty = install the full recommended bundle.
+    domain_id: Optional[str] = None  # None = global rules.
+
+
 # ── Domains ───────────────────────────────────────────────────────────────────
 
 class PolicyDomainCreate(BaseModel):
@@ -180,7 +190,7 @@ class PolicyContractRead(BaseModel):
     effective_sensitivity: str
     pii_detected: bool
 
-    decision: Literal["ALLOW", "DENY", "REDACT", "ANONYMIZE", "GENERALIZE", "SUMMARIZE", "ALLOW_WITH_WATERMARK"]
+    decision: Literal["ALLOW", "DENY", "REDACT", "ANONYMIZE", "GENERALIZE", "SUMMARIZE", "ALLOW_WITH_WATERMARK", "FIELD_SCOPED"]
     max_detail: str
     numeric_granularity: str
     violation_action: str

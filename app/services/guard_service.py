@@ -479,9 +479,18 @@ class GuardService:
 
     # Guard 1: classify query intent; block or rewrite if unsafe.
     def check_intent(self, query: str) -> IntentResult:
-        query = (query or "").strip()
+        from app.services.prompt_injection_guard import prompt_injection_guard
+        query = prompt_injection_guard.normalize(query)
         if not query:
             return IntentResult(action="ALLOW", risk="LOW", class_="SAFE", reason="Empty query")
+
+        injection = prompt_injection_guard.inspect_user_input(query)
+        if injection.blocked:
+            logger.warning("Guard1 PROMPT_INJECTION BLOCK categories=%s", injection.reason)
+            return IntentResult(
+                action="BLOCK", risk="HIGH", class_="PROMPT_INJECTION",
+                reason="Deterministic prompt-injection boundary triggered",
+            )
 
         local_block = self._local_injection_check(query)
         if local_block:

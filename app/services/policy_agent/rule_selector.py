@@ -14,6 +14,20 @@ _MAX_DETAIL_ORDER = {"redact": 4, "anonymize": 3, "generalize": 2, "summarize": 
 _NUMERIC_ORDER    = {"hidden": 4, "aggregated": 3, "range_only": 2, "exact": 1}
 
 
+def _infer_legacy_targets(rule: dict) -> tuple[list[str], list[str]]:
+    """Infer field scope for older rules created before target fields existed."""
+    explicit_types = [str(v).lower() for v in (rule.get("target_entity_types") or [])]
+    explicit_flags = [str(v).lower() for v in (rule.get("target_flags") or [])]
+    if explicit_types or explicit_flags:
+        return explicit_types, explicit_flags
+    text = f"{rule.get('rule_code', '')} {rule.get('name', '')}".lower()
+    if any(word in text for word in ("salary", "lương", "luong", "payroll", "wage", "compensation", "thưởng", "thuong")):
+        return ["money", "salary", "salary_amount"], ["has_financial", "has_hr"]
+    if any(word in text for word in ("personal", "cá nhân", "ca nhan", "pii", "contact", "thông tin cá nhân", "thong tin ca nhan")):
+        return ["person_name", "name", "email", "phone", "address", "dob", "national_id"], ["has_pii"]
+    return [], []
+
+
 @dataclass
 class ScoredRule:
     rule_id:     str
@@ -27,6 +41,8 @@ class ScoredRule:
     score:       float
     reasons:     list[str] = field(default_factory=list)
     contract:    dict       = field(default_factory=dict)
+    target_entity_types: list[str] = field(default_factory=list)
+    target_flags: list[str] = field(default_factory=list)
 
 
 @dataclass
@@ -52,6 +68,10 @@ class SelectionContext:
     is_after_publish_date:     bool = False
     # Effective clearance derived from the user position closest to the chunk (1–5).
     effective_clearance:       int = 1
+    detected_entity_types:     set[str] = field(default_factory=set)
+    detected_flags:            set[str] = field(default_factory=set)
+    user_oui_ids:              set[str] = field(default_factory=set)
+    chunk_oui_ids:             set[str] = field(default_factory=set)
 
 
 class RuleSelector:
@@ -114,8 +134,8 @@ class RuleSelector:
             "candidate_count":   len(candidates),
         }
 
-    # Conflict resolution: block > conditional (merged) > watermark > allow.
-    # Conditional rules from multiple domains are merged into one contract (most restrictive wins per field).
+    # Resolve whole-chunk rules normally, but keep entity-targeted rules
+    # independent so a salary deny does not discard allowed personal fields.
     def resolve_conflicts(self, selected_rules: list[ScoredRule]) -> dict:
         if not selected_rules:
             return {
@@ -126,49 +146,61 @@ class RuleSelector:
             }
 
         def _action(r: ScoredRule) -> str:
-            return r.contract.get("violation_action") or r.action or "allow"
+            action = str(r.contract.get("violation_action") or r.action or "allow").lower()
+            return {"deny": "block", "redact": "conditional", "anonymize": "conditional", "generalize": "conditional", "allow_with_watermark": "watermark"}.get(action, action)
 
         def top(rules: list[ScoredRule]) -> ScoredRule:
             return max(rules, key=lambda r: r.priority)
 
-        block_rules       = [r for r in selected_rules if _action(r) == "block"]
-        conditional_rules = [r for r in selected_rules if _action(r) == "conditional"]
-        watermark_rules   = [r for r in selected_rules if _action(r) == "watermark"]
-        allow_rules       = [r for r in selected_rules if _action(r) == "allow"]
+        scoped_rules = [r for r in selected_rules if r.target_entity_types or r.target_flags]
+        whole_chunk_rules = [r for r in selected_rules if r not in scoped_rules]
 
-        if block_rules:
+        def resolve_whole_chunk(rules: list[ScoredRule]) -> dict:
+            block_rules       = [r for r in rules if _action(r) == "block"]
+            conditional_rules = [r for r in rules if _action(r) == "conditional"]
+            watermark_rules   = [r for r in rules if _action(r) == "watermark"]
+            allow_rules       = [r for r in rules if _action(r) == "allow"]
+            if block_rules:
+                return {"final_action": "block", "winning_rule": top(block_rules),
+                        "contract": {"violation_action": "block"}, "reason": "block_overrides"}
+            if conditional_rules:
+                return {"final_action": "conditional", "winning_rule": top(conditional_rules),
+                        "contract": self._merge_conditional(conditional_rules), "reason": "conditional_merged"}
+            if watermark_rules:
+                return {"final_action": "watermark", "winning_rule": top(watermark_rules),
+                        "contract": {"violation_action": "watermark"}, "reason": "watermark_only"}
+            if allow_rules:
+                return {"final_action": "allow", "winning_rule": top(allow_rules),
+                        "contract": {"violation_action": "allow"}, "reason": "allow_only"}
+            return {"final_action": "allow", "winning_rule": None, "contract": {}, "reason": "no_whole_chunk_rule"}
+
+        whole_resolution = resolve_whole_chunk(whole_chunk_rules)
+        if scoped_rules and whole_resolution["final_action"] != "block":
+            field_rules = []
+            for rule in sorted(scoped_rules, key=lambda r: r.priority, reverse=True):
+                field_rules.append({
+                    "rule_code": rule.rule_code,
+                    "name": rule.name,
+                    "action": _action(rule),
+                    "priority": rule.priority,
+                    "target_entity_types": rule.target_entity_types,
+                    "target_flags": rule.target_flags,
+                    "contract": rule.contract,
+                })
             return {
-                "final_action": "block",
-                "winning_rule": top(block_rules),
-                "contract":     {"violation_action": "block"},
-                "reason":       "block_overrides",
+                "final_action": "field_scoped",
+                "winning_rule": top(scoped_rules),
+                "contract": {
+                    "violation_action": "field_scoped",
+                    "field_rules": field_rules,
+                    "global_action": whole_resolution["final_action"],
+                    "global_contract": whole_resolution.get("contract") or {},
+                },
+                "reason": "field_scoped_conflicts_resolved_independently",
             }
-
-        if conditional_rules:
-            return {
-                "final_action": "conditional",
-                "winning_rule": top(conditional_rules),
-                "contract":     self._merge_conditional(conditional_rules),
-                "reason":       "conditional_merged",
-            }
-
-        if watermark_rules:
-            return {
-                "final_action": "watermark",
-                "winning_rule": top(watermark_rules),
-                "contract":     {"violation_action": "watermark"},
-                "reason":       "watermark_only",
-            }
-
-        if allow_rules:
-            return {
-                "final_action": "allow",
-                "winning_rule": top(allow_rules),
-                "contract":     {"violation_action": "allow"},
-                "reason":       "allow_only",
-            }
-
-        return {"final_action": "block", "winning_rule": None, "contract": {}, "reason": "fallback_deny"}
+        if whole_chunk_rules:
+            return whole_resolution
+        return {"final_action": "allow", "winning_rule": None, "contract": {}, "reason": "no_scoped_target"}
 
     # Merge multiple conditional rules into one contract: most restrictive per field wins.
     def _merge_conditional(self, rules: list[ScoredRule]) -> dict:
@@ -187,6 +219,7 @@ class RuleSelector:
         self, rule: dict, domain_code: str, ctx: SelectionContext
     ) -> ScoredRule | None:
         reasons: list[str] = []
+        target_entity_types, target_flags = _infer_legacy_targets(rule)
 
         # ── 1. Exemption roles — if the user holds one of these, the rule does not apply.
         exempt_roles = rule.get("applicable_roles") or []
@@ -213,6 +246,8 @@ class RuleSelector:
                 score      = round(score, 3),
                 reasons    = reasons,
                 contract   = rule.get("contract") or {},
+                target_entity_types = target_entity_types,
+                target_flags = target_flags,
             )
 
         # ── 3. Sensitivity check ───────────────────────────────────────────────
@@ -230,6 +265,19 @@ class RuleSelector:
         intents = rule.get("applicable_intents") or []
         if intents and ctx.intent_class not in intents:
             return None
+
+        applicable_oui_ids = {str(v) for v in (rule.get("applicable_oui_ids") or [])}
+        if applicable_oui_ids and not applicable_oui_ids.intersection(ctx.user_oui_ids | ctx.chunk_oui_ids):
+            return None
+
+        detected_types = {str(v).lower() for v in ctx.detected_entity_types}
+        detected_flags = {str(v).lower() for v in ctx.detected_flags}
+        if target_entity_types and not detected_types.intersection(target_entity_types):
+            return None
+        if target_flags and not detected_flags.intersection(target_flags):
+            return None
+        if target_entity_types or target_flags:
+            reasons.append("field_target_match")
 
         # ── 5. Cross-department / org-hierarchy check ──────────────────────────
         if rule.get("cross_dept_only"):
@@ -269,4 +317,6 @@ class RuleSelector:
             score      = round(score, 3),
             reasons    = reasons,
             contract   = rule.get("contract") or {},
+            target_entity_types = target_entity_types,
+            target_flags = target_flags,
         )

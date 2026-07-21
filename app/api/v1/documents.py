@@ -79,8 +79,30 @@ def pending_review_count(
 ):
     if not _is_corp_member(db, current_user):
         return {"count": 0}
-    count = db.query(DocumentModel).filter(DocumentModel.status == "review").count()
+    count = db.query(DocumentModel).filter(DocumentModel.status.in_(["review", "uploaded"])).count()
     return {"count": count}
+
+
+@router.get("/pending-approvals", response_model=list[DocumentRead])
+def pending_approvals(
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """Return every document waiting for corp-level approval.
+
+    This intentionally does not use the normal FGA/viewable-document query:
+    reviewers need to see pending documents owned by other employees before
+    deciding whether to approve them.
+    """
+    if not _is_corp_member(db, current_user):
+        raise HTTPException(status_code=403, detail="Corp-level required")
+    docs = (
+        db.query(DocumentModel)
+        .filter(DocumentModel.status.in_(["review", "uploaded"]))
+        .order_by(DocumentModel.updated_at.desc())
+        .all()
+    )
+    return [DocumentRead.model_validate(doc) for doc in docs]
 
 
 # Retrieve a single document by ID, enforcing access control.

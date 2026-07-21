@@ -68,6 +68,24 @@ class EmbeddingService:
                 base_url=self.base_url or None,
             )
 
+    def _refresh_runtime_settings(self) -> None:
+        """Pick up the model selected in Settings without restarting the API."""
+        try:
+            from app.db.session import SessionLocal
+            from app.repositories.system_setting_repository import system_setting_repository
+            with SessionLocal() as db:
+                values = system_setting_repository.get_all(db)
+            selected_provider = (values.get("llm.provider") or self.provider).lower()
+            selected_model = values.get("llm.embedding_model") or self.model_name
+            if selected_provider != self.provider or selected_model != self.model_name:
+                self.provider = selected_provider
+                self.model_name = selected_model
+                self.client = None
+                if self.provider == "openai" and OpenAI is not None and self.api_key:
+                    self.client = OpenAI(api_key=self.api_key, base_url=self.base_url or None)
+        except Exception:
+            logger.debug("Runtime embedding settings unavailable; keeping current configuration", exc_info=True)
+
     # Return True if the embedding provider has the required credentials or server.
     def is_configured(self) -> bool:
         if self.provider == "openai":
@@ -138,6 +156,7 @@ class EmbeddingService:
 
     # Batch-embed texts, splitting into sub-batches to stay within API limits.
     def embed_many(self, texts: Iterable[str]) -> list[list[float]]:
+        self._refresh_runtime_settings()
         cleaned = [(t or "").strip() for t in texts]
         # keep track of original positions; skip empty but remember slots
         non_empty_idx: list[int] = []

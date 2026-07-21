@@ -174,6 +174,8 @@ class PolicyContractAgent:
         is_off_hours:             bool = False,
         user_positions:           list[dict] | None = None,  # [{oui_id, clearance}]
         detected_entity_types:    set[str] | None = None,    # pre-computed by batch extractor
+        detected_flags:           set[str] | None = None,
+        detected_entities:        list[dict] | None = None,
         rule_filter_cache:        dict | None = None,        # request-scoped LLM relevance cache
         db=None,
     ) -> dict:
@@ -183,13 +185,20 @@ class PolicyContractAgent:
 
         # ── 1. Realtime Entity Extraction ──────────────────────────────────
         # Skip if already pre-computed by the batch extractor in chat_service.
-        if detected_entity_types is None:
+        if detected_entity_types is None or detected_flags is None:
             try:
-                from app.services.entity_extractor import extract_realtime
-                _, detected_entity_types = extract_realtime(chunk_text, db=db)
+                from app.services.entity_extractor import run_pipeline
+                extracted = run_pipeline(chunk_text, db=db)
+                detected_entity_types = set(extracted.get("entity_types") or [])
+                detected_flags = {k for k, value in (extracted.get("labels") or {}).items() if value}
+                detected_entities = extracted.get("entities") or []
             except Exception as exc:
                 logger.warning("Realtime entity extraction failed chunk=%s: %s", chunk_id, exc)
                 detected_entity_types = set()
+                detected_flags = set()
+                detected_entities = []
+        detected_entity_types = detected_entity_types or set()
+        detected_flags = detected_flags or set()
         print(f"[POLICY] 1. entities detected: {sorted(detected_entity_types) or '(none)'}")
 
         # ── 2. Domain Classification ───────────────────────────────────────
@@ -211,7 +220,7 @@ class PolicyContractAgent:
 
         # ── 3. Sensitivity Scoring ─────────────────────────────────────────
         declared_label = _INT_TO_SENSITIVITY.get(declared_sensitivity, "Internal")
-        pii_detected   = False  # flags removed; chunk_sensitivity already computed at ingest
+        pii_detected   = "has_pii" in detected_flags
 
         # Get domain base sensitivity from DB
         domain_base_sensitivity = 2  # default: Internal
@@ -266,6 +275,10 @@ class PolicyContractAgent:
             intent_class=intent_class,
             intent_risk_signal=intent_result.risk_signal,
             effective_clearance=eff_clearance,
+            detected_entity_types=set(detected_entity_types),
+            detected_flags=set(detected_flags),
+            user_oui_ids={str(p.get("oui_id")) for p in (user_positions or []) if p.get("oui_id")},
+            chunk_oui_ids={str(v) for v in chunk_oui_ids},
         )
 
         db_rules: list = []
@@ -311,6 +324,8 @@ class PolicyContractAgent:
             "max_detail":          contract_terms.get("max_detail", "generalize"),
             "numeric_granularity": contract_terms.get("numeric_granularity", "aggregated"),
             "violation_action":    contract_terms.get("violation_action", "allow"),
+            "contract":             contract_terms,
+            "field_rules":          contract_terms.get("field_rules", []),
             # Applied rules summary
             "applied_rules": [
                 {
@@ -321,6 +336,8 @@ class PolicyContractAgent:
                     "action":     r.contract.get("violation_action", r.action),
                     "score":      r.score,
                     "reasons":    r.reasons,
+                    "target_entity_types": r.target_entity_types,
+                    "target_flags": r.target_flags,
                 }
                 for r in selected_rules
             ],
