@@ -17,6 +17,10 @@ DEFAULTS: dict[str, Any] = {
     "rag.similarity_threshold": 0.0,
     "rag.hybrid_search": True,
     "query_scope_mode": "full_db",
+    "llm.provider": None,
+    "llm.chat_model": None,
+    "llm.reasoning_effort": "medium",
+    "llm.embedding_model": None,
 }
 
 

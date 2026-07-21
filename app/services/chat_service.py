@@ -30,11 +30,12 @@ from app.services.intent_classifier import intent_classifier
 from app.services.llm_service import llm_service
 from app.services.memory_service import memory_service
 from app.services.policy_agent import policy_contract_agent
+from app.services.prompt_injection_guard import prompt_injection_guard
 from app.services.retrieval_service import retrieval_service
 from app.utils.status_answer import is_no_answer
 
 # Toggle Guard 1/2/3 enforcement; set True to enable intent and PII checks.
-GUARDS_ENABLED = False
+GUARDS_ENABLED = True
 # Toggle policy-contract per-chunk enforcement.
 POLICY_ENABLED = True
 # Terminal assistant message statuses considered complete for listing.
@@ -390,7 +391,9 @@ class ChatService:
     def _apply_transforms(self, chunks: list[dict]) -> list[dict]:
         result = []
         for c in chunks:
-            if c.get("_needs_redact"):
+            if c.get("_needs_field_policy"):
+                result.append(self._apply_field_scoped_policy(c))
+            elif c.get("_needs_redact"):
                 result.append(self._redact_chunk(c))
             elif c.get("_needs_anonymize"):
                 result.append(self._anonymize_chunk(c))
@@ -404,6 +407,82 @@ class ChatService:
                 result.append(wc)
             else:
                 result.append(c)
+        return result
+
+    def _apply_field_scoped_policy(self, chunk: dict) -> dict:
+        """Mask only entity spans covered by field-scoped policy rules.
+
+        This is intentionally deterministic.  A second LLM rewrite could
+        accidentally reconstruct a blocked salary while rewriting an allowed
+        personal field, so salary/PII replacements happen before answer
+        generation and never leave the protected value in the RAG context.
+        """
+        text = chunk.get("document_text") or ""
+        contract = chunk.get("_policy_contract") or {}
+        entities = chunk.get("_policy_entities") or []
+        field_rules = contract.get("field_rules") or []
+        if not text or not field_rules or not entities:
+            return chunk
+
+        builtin_flags = {
+            "email": {"has_pii"}, "phone": {"has_pii"},
+            "national_id": {"has_pii", "has_hr"}, "tax_id": {"has_pii", "has_hr"},
+            "social_insurance": {"has_pii", "has_hr"}, "bank_account": {"has_pii", "has_financial"},
+            "dob": {"has_pii", "has_hr"}, "money": {"has_financial"},
+            "percentage": {"has_financial"},
+        }
+        detail_order = {"redact": 4, "anonymize": 3, "generalize": 2, "summarize": 1}
+        replacements: list[tuple[int, int, str]] = []
+
+        for entity in sorted(entities, key=lambda item: (int(item.get("start", 0)), -int(item.get("end", 0)))):
+            try:
+                start, end = int(entity.get("start", 0)), int(entity.get("end", 0))
+            except (TypeError, ValueError):
+                continue
+            if start < 0 or end <= start or end > len(text):
+                continue
+            label = str(entity.get("label") or "").lower()
+            flags = builtin_flags.get(label, set())
+            matches = []
+            for rule in field_rules:
+                targets = {str(v).lower() for v in (rule.get("target_entity_types") or [])}
+                target_flags = {str(v).lower() for v in (rule.get("target_flags") or [])}
+                if (targets and label in targets) or (target_flags and flags.intersection(target_flags)):
+                    matches.append(rule)
+            if not matches:
+                continue
+
+            if any(str(rule.get("action", "")).lower() == "block" for rule in matches):
+                replacement = "[ĐÃ ẨN THEO CHÍNH SÁCH]"
+            else:
+                rule = max(matches, key=lambda item: detail_order.get(str((item.get("contract") or {}).get("max_detail", "generalize")).lower(), 2))
+                detail = str((rule.get("contract") or {}).get("max_detail", "generalize")).lower()
+                if detail == "redact":
+                    replacement = "[ĐÃ ẨN]"
+                elif detail == "anonymize":
+                    replacement = "[ĐỐI TƯỢNG ĐÃ ẨN DANH]"
+                elif detail == "summarize":
+                    replacement = "[THÔNG TIN ĐÃ TÓM TẮT]"
+                elif label in {"money", "percentage", "bank_account"} or "financial" in label:
+                    replacement = "[GIÁ TRỊ TÀI CHÍNH ĐÃ KHÁI QUÁT]"
+                else:
+                    replacement = "[THÔNG TIN CÁ NHÂN ĐÃ KHÁI QUÁT]"
+            replacements.append((start, end, replacement))
+
+        if not replacements:
+            return chunk
+        # Apply right-to-left and avoid overlapping replacements.
+        output = text
+        occupied_end = len(text) + 1
+        for start, end, replacement in sorted(replacements, key=lambda item: item[0], reverse=True):
+            if end > occupied_end:
+                continue
+            output = output[:start] + replacement + output[end:]
+            occupied_end = start
+        result = dict(chunk)
+        result["document_text"] = output
+        result.pop("_policy_entities", None)
+        result.pop("_needs_field_policy", None)
         return result
 
     # Run the policy-contract agent per chunk; return (approved_chunks, contracts).
@@ -451,11 +530,11 @@ class ChatService:
         # ── Batch GLiNER for all chunks at once ───────────────────────────
         chunk_texts = [c.get("document_text") or "" for c in chunks]
         try:
-            from app.services.entity_extractor import extract_realtime_batch
-            batch_entities = extract_realtime_batch(chunk_texts, db=db)
+            from app.services.entity_extractor import extract_realtime_batch_detailed
+            batch_details = extract_realtime_batch_detailed(chunk_texts, db=db)
         except Exception as exc:
             logger.warning("Batch entity extraction failed: %s", exc)
-            batch_entities = [set() for _ in chunks]
+            batch_details = [{"entities": [], "entity_types": set(), "flags": set()} for _ in chunks]
 
         # Shared across chunks — LLM relevance filter fires at most once per unique rule set.
         rule_filter_cache: dict = {}
@@ -479,13 +558,15 @@ class ChatService:
                     intent_class=intent_class,
                     raw_query=raw_query,
                     user_positions=user_positions,
-                    detected_entity_types=batch_entities[i],
+                    detected_entity_types=batch_details[i].get("entity_types", set()),
+                    detected_flags=batch_details[i].get("flags", set()),
+                    detected_entities=batch_details[i].get("entities", []),
                     rule_filter_cache=rule_filter_cache,
                     db=db,
                 )
                 contracts.append(contract)
 
-                decision   = contract.get("decision", "allow")
+                decision   = str(contract.get("decision", "allow")).lower()
                 max_detail = contract.get("max_detail", "generalize")
                 _ctr = {
                     "max_detail":          max_detail,
@@ -509,6 +590,13 @@ class ChatService:
                         chunk["_needs_generalize"] = True
                     print(f"[POLICY]   → CONDITIONAL: transform={max_detail} numeric={_ctr['numeric_granularity']}")
                     logger.info("Policy conditional chunk=%s max_detail=%s", chunk_id, max_detail)
+                elif decision == "field_scoped":
+                    chunk = dict(chunk)
+                    policy_contract = contract.get("contract") or {}
+                    chunk["_policy_contract"] = policy_contract
+                    chunk["_policy_entities"] = batch_details[i].get("entities", [])
+                    chunk["_needs_field_policy"] = True
+                    logger.info("Policy field-scoped chunk=%s rules=%s", chunk_id, len(policy_contract.get("field_rules") or []))
                 elif decision == "watermark":
                     chunk = dict(chunk)
                     chunk["_needs_watermark"] = True
@@ -689,6 +777,11 @@ class ChatService:
             if retrieved:
                 logger.info("Retrieval fallback best-effort: top1 score=%.3f", retrieved[0].get("score") or 0)
 
+        # Retrieved documents are untrusted data.  Keep an audit marker for
+        # suspicious instructions; llm_service also wraps the text with a
+        # hard data boundary before sending it to the model.
+        retrieved = prompt_injection_guard.annotate_chunks(retrieved)
+
         # ── [GUARD 2] PII scan on retrieved chunks ─────────────────────
         logger.info("USER ROLE: %s USER ID: %s", getattr(user, "role", None), getattr(user, "id", None))
         if GUARDS_ENABLED:
@@ -702,7 +795,7 @@ class ChatService:
             retrieved, policy_contracts = self._apply_policy_contracts(
                 db, retrieved, user, effective_query, query_intent
             )
-            has_watermark = any(c.get("decision") == "ALLOW_WITH_WATERMARK" for c in policy_contracts)
+            has_watermark = any(str(c.get("decision", "")).lower() in {"watermark", "allow_with_watermark"} for c in policy_contracts)
             print(f"[POLICY] intent={query_intent} approved={len(retrieved)}/{len(retrieved_raw)} watermark={has_watermark}")
             for _c in policy_contracts:
                 rules = [r.get("rule_code") for r in _c.get("applied_rules", [])]
@@ -714,13 +807,13 @@ class ChatService:
         seen_rule_codes: set[str] = set()
         applied_rules: list[dict] = []
         for contract in policy_contracts:
-            final_decision = contract.get("decision", "allow")
+            final_decision = str(contract.get("decision", "allow")).lower()
             if final_decision == "allow":
                 continue
             for rule in contract.get("applied_rules", []):
                 # Only surface rules whose own action determined the final outcome.
                 # e.g. block+conditional → only block rules shown; conditional+conditional → all shown.
-                if rule.get("action", "") != final_decision:
+                if final_decision != "field_scoped" and str(rule.get("action", "")).lower() != final_decision:
                     continue
                 code = rule.get("rule_code", "")
                 if code and code not in seen_rule_codes:
@@ -728,14 +821,14 @@ class ChatService:
                     applied_rules.append({
                         "rule_code": code,
                         "name":      rule.get("name", code),
-                        "action":    final_decision,
+                        "action":    rule.get("action", final_decision) if final_decision == "field_scoped" else final_decision,
                         "domain":    rule.get("domain", ""),
                     })
 
         has_restricted = bool(retrieved and any(
             c.get("document_text") == _POLICY_NOTICE for c in retrieved
         )) or bool(
-            policy_contracts and any(c.get("decision") in ("DENY", "REDACT") for c in policy_contracts)
+            policy_contracts and any(str(c.get("decision", "")).lower() in ("block", "deny", "redact") for c in policy_contracts)
         )
         all_restricted = bool(retrieved and all(
             c.get("document_text") == _POLICY_NOTICE for c in retrieved
@@ -864,6 +957,7 @@ class ChatService:
     ):
         tid = self._get_trace_id(trace_id)
         _start = time.perf_counter()
+        content = prompt_injection_guard.normalize(content)
 
         if client_message_id:
             existing = self.msgs.find_by_client_id(db, conversation_id, client_message_id)
@@ -949,7 +1043,6 @@ class ChatService:
                     chat_history=safe_history,
                     extra_instructions=_extra_instructions,
                 )
-                print(f"[LLM PROMPT]\n{'='*60}\n{prompt}\n{'='*60}")
                 llm_text, llm_raw, _ = llm_service.generate(
                     prompt=prompt, max_tokens=512, temperature=0.0,
                 )
@@ -1046,9 +1139,11 @@ class ChatService:
     ):
         tid = self._get_trace_id(trace_id)
         _start = time.perf_counter()
+        content = prompt_injection_guard.normalize(content)
         llm_extra_context = ""
         if file_content:
             label = file_name or "file"
+            file_content = prompt_injection_guard.wrap_untrusted_context(file_content[:40000])
             llm_extra_context = f"[Tài liệu đính kèm: {label}]\n\n{file_content[:40000]}\n\n---\n"
 
         user_msg = Message(
@@ -1231,7 +1326,6 @@ class ChatService:
                         chat_history=safe_history,
                         extra_instructions=_stream_extra,
                     )
-                    print(f"[LLM STREAM PROMPT]\n{'='*60}\n{prompt}\n{'='*60}")
                     logger.info("LLM stream prompt trace_id=%s", tid)
 
                     for token in llm_service.generate_stream(prompt=prompt, max_tokens=2048):

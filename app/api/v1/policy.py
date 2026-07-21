@@ -23,12 +23,41 @@ from app.schemas.policy import (
     PolicyDomainUpdate,
     SuggestEntitiesRequest,
     SuggestEntitiesResponse,
+    InstallRuleTemplatesRequest,
 )
 from app.services.entity_extractor import invalidate_label_cache
 from app.services.policy_agent.domain_classifier import invalidate_domain_cache
 from app.services.policy_service import policy_service
+from app.services.policy_templates import get_policy_template, list_policy_templates
 
 router = APIRouter()
+
+
+@router.get("/rule-templates")
+def list_rule_templates(_: User = Depends(get_current_user)):
+    """Return built-in rules without writing anything to the database."""
+    return list_policy_templates()
+
+
+@router.post("/rule-templates/install")
+def install_rule_templates(
+    payload: InstallRuleTemplatesRequest,
+    db: Session = Depends(get_db),
+    _: User = Depends(get_current_user),
+):
+    """Install selected built-ins as normal editable rules; duplicates are skipped."""
+    codes = payload.template_codes or [item["template_code"] for item in list_policy_templates()]
+    created, skipped = [], []
+    for code in codes:
+        template = get_policy_template(code)
+        if not template:
+            raise HTTPException(status_code=404, detail=f"Unknown rule template: {code}")
+        rule_data = template["rule"]
+        if policy_repository.get_rule_by_code(db, rule_data.rule_code):
+            skipped.append(rule_data.rule_code)
+            continue
+        created.append(policy_service.create_rule(db, payload.domain_id, rule_data))
+    return {"created": [DomainRuleRead.model_validate(rule) for rule in created], "skipped": skipped}
 
 
 # ── Domains ───────────────────────────────────────────────────────────────────

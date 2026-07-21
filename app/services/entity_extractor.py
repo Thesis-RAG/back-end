@@ -276,6 +276,43 @@ def extract_realtime_batch(
     return results
 
 
+def extract_realtime_batch_detailed(
+    texts: list[str],
+    *,
+    db=None,
+    threshold: float = 0.3,
+) -> list[dict]:
+    """Return structured entities, GLiNER entities, types and boolean flags.
+
+    Policy enforcement needs spans, not just a set of labels, in order to mask
+    only the salary/PII field inside a mixed chunk.  This keeps the existing
+    lightweight batch API intact and adds a detailed variant for that path.
+    """
+    if not texts:
+        return []
+    gliner_labels, entity_flags = _refresh_cache(db)
+    model = _get_gliner() if gliner_labels else None
+    results: list[dict] = []
+    for text in texts:
+        structured = extract_structured_entities(text)
+        freetext: list[dict] = []
+        if model is not None:
+            try:
+                freetext = model.predict_entities(text, gliner_labels, threshold=threshold)
+                for entity in freetext:
+                    entity["source"] = "gliner"
+            except Exception as exc:
+                logger.debug("GLiNER detailed extraction failed: %s", exc)
+        entities = structured + freetext
+        labels = detect_boolean_labels(text, entities, entity_flags)
+        results.append({
+            "entities": entities,
+            "entity_types": {str(e.get("label")) for e in entities if e.get("label")},
+            "flags": {key for key, value in labels.items() if value},
+        })
+    return results
+
+
 # ── Pipeline ──────────────────────────────────────────────────────────────────
 
 # Run all three extraction layers and return entities, boolean labels, and deduplicated entity types.
