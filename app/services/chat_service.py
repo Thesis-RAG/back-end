@@ -34,6 +34,7 @@ from app.services.memory_service import memory_service
 from app.services.policy_agent import policy_contract_agent
 from app.services.prompt_injection_guard import prompt_injection_guard
 from app.services.retrieval_service import retrieval_service
+from app.utils.markdown_tables import normalize_markdown_tables
 from app.utils.status_answer import is_no_answer
 
 # Keep input prompt-injection detection enabled. PII masking is intentionally
@@ -1289,6 +1290,7 @@ class ChatService:
             policy_summary,
             tid,
         )
+        answer_text = normalize_markdown_tables(answer_text)
 
         # ── Watermark notice ──────────────────────────────────────────
         if has_watermark and answer_text:
@@ -1575,6 +1577,7 @@ class ChatService:
             stream_policy_summary,
             tid,
         )
+        full_text = normalize_markdown_tables(full_text)
 
         # Add the audit notice after filtering so the final-output filter
         # cannot remove this required policy signal as unrelated text.
