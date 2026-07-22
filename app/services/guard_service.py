@@ -1,10 +1,9 @@
 """
-Guard service: pre/post safety guards for the RAG pipeline.
+Input prompt-injection guard for the RAG pipeline.
 
-  Guard 1 (pre-query)  — intent classification (LLM).
-  Guard 2 (pre-LLM)    — PII scan on retrieved chunks (Presidio + regex).
-  Guard 3a (post-LLM)  — fast PII + keyword scan on the LLM response.
-  Guard 3b (post-LLM)  — LLM-as-judge, triggered only when Guard 3a fires.
+PII masking is deliberately not performed here. Policy rules are the single
+source of truth for transforming retrieved fields and final answers.
+
 """
 
 from __future__ import annotations
@@ -40,7 +39,8 @@ class IntentResult:
         return self.action == "REWRITE" and bool(self.rewrite)
 
 
-# A single detected PII entity with span and confidence score.
+# Compatibility result types for legacy callers. The chat pipeline no longer
+# invokes the PII scanning methods below; policy rules own all data masking.
 @dataclass
 class PIIEntity:
     entity_type: str
@@ -50,14 +50,13 @@ class PIIEntity:
     score: float
 
 
-# Result from Guard 3b LLM-as-judge evaluation.
 @dataclass
 class JudgeResult:
-    leaked: bool              # whether a real leak was detected.
-    severity: str             # HIGH | MEDIUM | LOW
-    action: str               # BLOCK | REDACT | ALLOW
+    leaked: bool
+    severity: str
+    action: str
     reason: str = ""
-    triggered_by: str = ""    # "pii" | "hard_secret" | "soft_secret"
+    triggered_by: str = ""
 
     @property
     def should_block(self) -> bool:
@@ -68,7 +67,6 @@ class JudgeResult:
         return self.action == "REDACT"
 
 
-# Result from Guard 2/3 PII and secret keyword scan.
 @dataclass
 class PIIScanResult:
     has_pii: bool
@@ -76,7 +74,7 @@ class PIIScanResult:
     entities: list[PIIEntity] = field(default_factory=list)
     redacted_text: str = ""
     secret_keywords_found: list[str] = field(default_factory=list)
-    judge: JudgeResult | None = None   # None if Guard 3b did not run.
+    judge: JudgeResult | None = None
 
 
 # ---------------------------------------------------------------------------
@@ -581,11 +579,15 @@ class GuardService:
         return None
 
     # ------------------------------------------------------------------
-    # Guard 2
+    # Legacy PII API (disabled)
     # ------------------------------------------------------------------
 
-    # Guard 2: PII-scan retrieved chunks and redact based on the user's clearance level.
+    # Legacy compatibility API; no longer used by the RAG pipeline.
     def scan_chunks(self, chunks: list[dict], user=None) -> list[dict]:
+        """Legacy compatibility hook; policy rules now own field masking."""
+        return [{**chunk, "_pii_redacted": False} for chunk in chunks]
+
+        # Kept below only for historical reference; unreachable by design.
         is_corp = getattr(user, "is_corp_member", False) if user else False
         max_clearance = getattr(user, "max_clearance", 1) if user else 1
 
@@ -635,11 +637,15 @@ class GuardService:
         return cleaned
 
     # ------------------------------------------------------------------
-    # Guard 3 (3a + 3b)
+    # Legacy response-scan API (disabled)
     # ------------------------------------------------------------------
 
-    # Guard 3 (3a + 3b): scan the LLM response for PII and secrets, optionally calling the judge.
+    # Legacy compatibility API; no longer used by the RAG pipeline.
     def scan_response(self, text: str, user=None) -> PIIScanResult:
+        """Legacy compatibility hook; never redacts a generated answer."""
+        return PIIScanResult(has_pii=False, has_secret=False, redacted_text=text)
+
+        # Kept below only for historical reference; unreachable by design.
         is_corp = getattr(user, "is_corp_member", False) if user else False
         max_clearance = getattr(user, "max_clearance", 1) if user else 1
         skip_redact = (is_corp and max_clearance >= 5)
@@ -709,8 +715,12 @@ class GuardService:
             judge=judge_result,
         )
 
-    # Pure PII scan for Guard 2 — does not invoke the LLM judge.
+    # Legacy compatibility API; no longer used by the RAG pipeline.
     def scan_pii(self, text: str) -> PIIScanResult:
+        """Legacy compatibility hook; policy evaluation replaces PII scanning."""
+        return PIIScanResult(has_pii=False, has_secret=False, redacted_text=text)
+
+        # Kept below only for historical reference; unreachable by design.
         if not text or not text.strip():
             return PIIScanResult(has_pii=False, has_secret=False, redacted_text=text)
 

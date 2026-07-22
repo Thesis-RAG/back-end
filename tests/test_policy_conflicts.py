@@ -135,3 +135,28 @@ def test_field_allow_alone_is_a_noop():
     assert result["document_text"] == text
     assert "_policy_entities" not in result
     assert "_needs_field_policy" not in result
+
+
+def test_final_filter_drops_hidden_answer_lines_and_citations(monkeypatch):
+    monkeypatch.setattr(
+        "app.services.chat_service.llm_service.is_configured",
+        lambda: False,
+    )
+
+    answer, sources = ChatService.__new__(ChatService)._filter_final_answer(
+        "Số điện thoại: giá trị đã được ẩn theo chính sách [1]\n"
+        "Phòng ban: Nhân sự [2]",
+        "Cho tôi phòng ban của nhân viên",
+        [
+            {"documentTitle": "Hồ sơ nhân viên", "excerpt": "giá trị đã được ẩn theo chính sách"},
+            {"documentTitle": "Cơ cấu tổ chức", "excerpt": "Phòng ban: Nhân sự"},
+        ],
+        [{"rule_code": "HR-PHONE-BLOCK", "action": "block"}],
+        [{"decision": "field_scoped", "field_rules": []}],
+        "trace-test",
+    )
+
+    assert "Số điện thoại" not in answer
+    assert answer == "Phòng ban: Nhân sự [1]"
+    assert len(sources) == 1
+    assert sources[0]["documentTitle"] == "Cơ cấu tổ chức"

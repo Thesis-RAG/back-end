@@ -13,6 +13,10 @@ class Message(Base, TimestampMixin):
     role = Column(String(32), nullable=False)  # user | assistant
     content = Column(Text, nullable=True)
     token_usage = Column(JSON, nullable=True)
+    # Snapshot of the policy rules that affected this assistant response.
+    # Stored with the message so historical conversations remain explainable
+    # even after rules are edited or removed.
+    applied_rules_json = Column(JSON, nullable=True)
     parent_message_id = Column(String(36), nullable=True)
     client_message_id = Column(String(36), nullable=True, index=True)
     status = Column(String(36), nullable=True, index=True)

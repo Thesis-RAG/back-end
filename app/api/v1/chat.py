@@ -66,6 +66,7 @@ def post_message(conversation_id: str, payload: MessageCreateRequest, request: R
             "content": assistant_msg.content,
             "status": assistant_msg.status,
             "createdAt": assistant_msg.created_at,
+            "appliedRules": assistant_msg.applied_rules_json or [],
         },
         traceId=request.state.trace_id,
         sources=src_objs,
