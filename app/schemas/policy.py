@@ -103,7 +103,7 @@ class DomainRuleRead(BaseModel):
     model_config = ConfigDict(from_attributes=True)
 
     id: str
-    domain_id: Optional[str]
+    domain_id: str
     rule_code: str
     name: str
     action: str           # Derived from violation_action, used internally.
@@ -119,7 +119,7 @@ class DomainRuleRead(BaseModel):
 
 class InstallRuleTemplatesRequest(BaseModel):
     template_codes: list[str] = []  # Empty = install the full recommended bundle.
-    domain_id: Optional[str] = None  # None = global rules.
+    domain_id: str
 
 
 # ── Domains ───────────────────────────────────────────────────────────────────

@@ -199,16 +199,15 @@ class PolicyService:
 
     # ── Rules ─────────────────────────────────────────────────────────────────
 
-    # Return all rules, optionally filtered to a specific domain.
-    def list_rules(self, db: Session, domain_id: str | None) -> list[DomainRule]:
+    # Return all rules for a specific domain.
+    def list_rules(self, db: Session, domain_id: str) -> list[DomainRule]:
         return policy_repository.list_rules(db, domain_id)
 
     # Create a new rule, raising ValueError on duplicate rule_code.
     def create_rule(
-        self, db: Session, domain_id: str | None, data: DomainRuleCreate
+        self, db: Session, domain_id: str, data: DomainRuleCreate
     ) -> DomainRule:
-        if domain_id:
-            self.get_domain(db, domain_id)
+        self.get_domain(db, domain_id)
         if policy_repository.get_rule_by_code(db, data.rule_code):
             raise ValueError(f"Rule code '{data.rule_code}' already exists")
         rule = policy_repository.create_rule(

@@ -48,11 +48,11 @@ class DomainEntityType(Base, TimestampMixin):
 
 
 class DomainRule(Base, TimestampMixin):
-    # Access control rules belonging to a policy domain (or global when domain_id=None).
+    # Access control rules always belong to a policy domain.
     __tablename__ = "domain_rules"
 
     id        = Column(String(36), primary_key=True, default=new_uuid)
-    domain_id = Column(String(36), ForeignKey("policy_domains.id"), nullable=True, index=True)
+    domain_id = Column(String(36), ForeignKey("policy_domains.id"), nullable=False, index=True)
     rule_code = Column(String(64), nullable=False, unique=True, index=True)   # e.g. HR-01-R001
     name      = Column(String(255), nullable=False)
     action    = Column(String(32), nullable=False)   # ALLOW | DENY | REDACT | ALLOW_WITH_WATERMARK

@@ -96,7 +96,7 @@ class RuleSelector:
                 "contract":   db_rule.contract_json or {},
                 **(db_rule.conditions_json or {}),
             }
-            domain_code = "GLOBAL" if db_rule.domain_id is None else ctx.domain_codes[0]
+            domain_code = ctx.domain_codes[0] if ctx.domain_codes else "UNCLASSIFIED"
 
             scored = self._score_rule(rule_dict, domain_code, ctx)
             if scored:
@@ -119,7 +119,8 @@ class RuleSelector:
             fallback = ScoredRule(
                 rule_id="FALLBACK", rule_code="FALLBACK", name="Default Allow",
                 action="ALLOW", priority=0, mandatory=False, risk_level="low",
-                domain_code="GLOBAL", score=1.0, reasons=["no_rule_match"],
+                domain_code=ctx.domain_codes[0] if ctx.domain_codes else "UNCLASSIFIED",
+                score=1.0, reasons=["no_rule_match"],
                 contract={
                     "violation_action": "allow",
                     "max_detail": "summarize",
@@ -200,8 +201,8 @@ class RuleSelector:
                 "contract": {
                     "violation_action": "field_scoped",
                     "field_rules": field_rules,
-                    "global_action": whole_resolution["final_action"],
-                    "global_contract": whole_resolution.get("contract") or {},
+                    "whole_chunk_action": whole_resolution["final_action"],
+                    "whole_chunk_contract": whole_resolution.get("contract") or {},
                 },
                 "reason": "field_scoped_conflicts_resolved_independently",
             }
