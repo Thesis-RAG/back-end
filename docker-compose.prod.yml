@@ -69,6 +69,22 @@ services:
         condition: service_completed_successfully
     restart: unless-stopped
 
+  openfga-bootstrap:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    env_file:
+      - ${BACKEND_ENV_FILE:-.env}
+    environment:
+      PYTHONPATH: /app
+    command: python -m app.fga.setup
+    volumes:
+      - openfga_config:/run/openfga
+    depends_on:
+      openfga:
+        condition: service_started
+    restart: "no"
+
   minio:
     image: minio/minio:latest
     command: server /data --console-address ":9001"
@@ -96,6 +112,8 @@ services:
       - ${BACKEND_ENV_FILE:-.env}
     environment:
       PYTHONPATH: /app
+    volumes:
+      - openfga_config:/run/openfga:ro
     depends_on:
       mysql:
         condition: service_healthy
@@ -103,6 +121,8 @@ services:
         condition: service_healthy
       openfga:
         condition: service_started
+      openfga-bootstrap:
+        condition: service_completed_successfully
       minio:
         condition: service_started
       chroma:
@@ -120,6 +140,8 @@ services:
       - ${BACKEND_ENV_FILE:-.env}
     environment:
       PYTHONPATH: /app
+    volumes:
+      - openfga_config:/run/openfga:ro
     depends_on:
       mysql:
         condition: service_healthy
@@ -127,6 +149,8 @@ services:
         condition: service_healthy
       openfga:
         condition: service_started
+      openfga-bootstrap:
+        condition: service_completed_successfully
       minio:
         condition: service_started
       chroma:
@@ -158,3 +182,4 @@ volumes:
   chroma_data:
   caddy_data:
   caddy_config:
+  openfga_config:

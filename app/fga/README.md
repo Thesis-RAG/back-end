@@ -1,24 +1,30 @@
-# Start postgres-fga
-docker compose up -d postgres-fga
+## Production
 
-# Wait for 5 second to start postgres
-Start-Sleep -Seconds 5
+`docker-compose.prod.yml` now starts an idempotent `openfga-bootstrap` service.
+It waits for OpenFGA, creates or reuses the `rag-enterprise` store, uploads or
+reuses the authorization model, and persists both IDs in the shared
+`openfga_config` volume. `OPENFGA_STORE_ID` and `OPENFGA_MODEL_ID` can therefore
+remain empty in `.env`; no manual copy is required.
 
-# Migrate schema OpenFGA into postgres
-docker compose run --rm openfga migrate
+From the backend directory, run:
 
-# Start all
-docker compose up -d
+```bash
+docker compose -f docker-compose.prod.yml up -d --build --force-recreate openfga-bootstrap api worker caddy
+```
 
-# Create store for OpenFGA
-$env:OPENFGA_URL="http://localhost:8080"; python -m app.fga.setup
-# Copy STORE_ID into .env and config.py (openfga_store_id).
+The API startup then reconciles the initial organization hierarchy, positions,
+admin assignment, OpenFGA parent links, memberships, and MinIO buckets.
 
-# Create model for OpenFGA
-docker exec -it rag-api python -c "import json, pathlib, sys; sys.path.insert(0, '.'); from app.fga.client import fga_client; model = json.loads((pathlib.Path('app/fga/model.json')).read_text()); model_id = fga_client.write_model(model); print(f'OPENFGA_MODEL_ID={model_id}')"
-# Copy MODEL_ID into .env and config.py (openfga_model_id).
+## Local OpenFGA API
 
-# To check store that created, browse: http://localhost:8080/stores
+The same idempotent script can be run manually when OpenFGA is available at the
+configured `OPENFGA_URL`:
+
+```bash
+python -m app.fga.setup
+```
+
+# To check the store that was created, browse: http://localhost:8080/stores
 # Result example: {"stores":[{"id":"01KMTFH0653Q23BT8R9BCA4GQN","name":"rag-enterprise","created_at":"2026-03-28T15:03:14.380041Z","updated_at":"2026-03-28T15:03:14.380041Z","deleted_at":null}],"continuation_token":""}
 
 # To view schemas by UI, browse: https://play.fga.dev/sandbox/?fga_api_host=localhost%3A8080&fga_api_scheme=http&store=<enter-store-id-here>

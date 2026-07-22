@@ -1,6 +1,7 @@
 """
 FastAPI application entry point: middleware, CORS, startup hooks, router registration, and auth dependency.
 """
+import logging
 import time
 import uuid
 
@@ -27,6 +28,7 @@ from app.core.config import settings
 from app.core.logging import configure_logging
 from app.db.init_db import init_db
 from app.db.session import SessionLocal, engine, get_db
+from app.fga.client import fga_client
 from app.models.user import User
 from app.schemas.auth import LoginRequest, TokenResponse
 from app.schemas.health import HealthResponse
@@ -41,6 +43,7 @@ from app.workers.ingest_tasks import process_ingest_job
 oauth2_scheme = OAuth2PasswordBearer(tokenUrl="/auth/login")
 
 configure_logging()
+logger = logging.getLogger(__name__)
 
 # Module-level FastAPI application instance; imported by uvicorn as the ASGI entrypoint.
 app = FastAPI(title="rag-role-enterprise-api", version="1.0.0")
@@ -86,19 +89,55 @@ def wait_for_database():
     raise RuntimeError("MySQL is not ready")
 
 
+# Ensure OpenFGA is reachable and has a reusable store/model before seeding tuples.
+def wait_for_openfga():
+    for attempt in range(30):
+        try:
+            # Probe the service even when IDs came from the shared config file.
+            fga_client.list_stores()
+            store_id, model_id = fga_client.ensure_configured()
+            logger.info(
+                "OpenFGA ready store=%s model=%s",
+                store_id,
+                model_id,
+            )
+            return
+        except Exception:
+            logger.warning(
+                "OpenFGA is not ready (attempt %d/30)",
+                attempt + 1,
+                exc_info=True,
+            )
+            time.sleep(2)
+    raise RuntimeError("OpenFGA did not become ready")
+
+
+# Wait for MinIO before declaring the API ready.
+def wait_for_storage():
+    for attempt in range(30):
+        try:
+            storage_service.ensure_buckets()
+            logger.info("MinIO buckets ready")
+            return
+        except Exception:
+            logger.warning(
+                "MinIO is not ready (attempt %d/30)",
+                attempt + 1,
+                exc_info=True,
+            )
+            time.sleep(2)
+    raise RuntimeError("MinIO did not become ready")
+
+
 # Wait for DB readiness, run migrations, seed defaults, and ensure MinIO buckets exist.
 @app.on_event("startup")
 def startup_event():
     wait_for_database()
     init_db()
+    wait_for_openfga()
     with SessionLocal() as db:
         bootstrap_service.seed_defaults(db)
-    for _ in range(30):
-        try:
-            storage_service.ensure_buckets()
-            break
-        except Exception:
-            time.sleep(2)
+    wait_for_storage()
 
 
 # FastAPI dependency: decode the Bearer token and return the active User, raising 401 otherwise.
