@@ -454,12 +454,54 @@ def _presidio_scan_pii(text: str) -> list[PIIEntity]:
 
 
 # Replace each detected entity span with a [ENTITY_TYPE] placeholder.
+MASKED_VALUE_TEXT = "giá trị đã được ẩn theo chính sách"
+_MASKED_MARKER_RE = re.compile(
+    r"\[(?:[A-Z][A-Z0-9_]*)(?:\][A-Z]+)?\]?",
+    re.ASCII,
+)
+
+
+def sanitize_masked_markers(text: str, *, drop_masked_lines: bool = False) -> str:
+    """Hide legacy ``[ENTITY_TYPE]`` markers before text reaches the user.
+
+    Older Guard 2 output used bracketed entity names. They are useful for
+    internal diagnostics but are not user-facing content and can otherwise be
+    copied verbatim by the answer model.
+    """
+    if not text:
+        return text
+
+    cleaned_lines: list[str] = []
+    for line in text.splitlines():
+        has_marker = bool(_MASKED_MARKER_RE.search(line))
+        if drop_masked_lines and has_marker and (
+            "|" in line
+            or "placeholder" in line.lower()
+            or "nhãn" in line.lower()
+            or "label" in line.lower()
+        ):
+            continue
+        cleaned_lines.append(_MASKED_MARKER_RE.sub(MASKED_VALUE_TEXT, line))
+    return "\n".join(cleaned_lines)
+
+
 def _redact_text(text: str, entities: list[PIIEntity]) -> str:
     if not entities:
         return text
     chars = list(text)
-    for ent in sorted(entities, key=lambda e: e.start, reverse=True):
-        chars[ent.start:ent.end] = list(f"[{ent.entity_type}]")
+    # Presidio and regex detectors can return overlapping spans. Keep the
+    # longest span at each start position so replacements cannot produce
+    # malformed values such as ``[ADDRESS]AME]``.
+    accepted: list[PIIEntity] = []
+    occupied_until = -1
+    for ent in sorted(entities, key=lambda e: (e.start, -(e.end - e.start))):
+        if ent.start < occupied_until:
+            continue
+        accepted.append(ent)
+        occupied_until = ent.end
+
+    for ent in sorted(accepted, key=lambda e: e.start, reverse=True):
+        chars[ent.start:ent.end] = list(MASKED_VALUE_TEXT)
     return "".join(chars)
 
 
