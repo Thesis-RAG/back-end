@@ -306,6 +306,35 @@ def update_position(
     return {"id": pos.id, "name": pos.name, "clearance": pos.clearance}
 
 
+# Delete a position only when it is not assigned to any user.
+@router.delete("/positions/{position_id}")
+def delete_position(
+    position_id: str,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    require_admin(current_user, db)
+    pos = db.get(Position, position_id)
+    if not pos:
+        raise HTTPException(status_code=404, detail="Position not found")
+
+    assignment_count = db.query(UserOuiPosition).filter(
+        UserOuiPosition.position_id == position_id,
+    ).count()
+    if assignment_count:
+        raise HTTPException(
+            status_code=409,
+            detail=(
+                f"Không thể xóa vị trí đang được gán cho {assignment_count} người dùng. "
+                "Hãy chuyển hoặc gỡ vị trí của các người dùng trước."
+            ),
+        )
+
+    db.delete(pos)
+    db.commit()
+    return {"status": "deleted", "position_id": position_id}
+
+
 # Re-sync FGA document tuples for all OUIs that use the given position.
 def _resync_docs_for_position(db: Session, position_id: str):
     from app.services.document_service import document_service
