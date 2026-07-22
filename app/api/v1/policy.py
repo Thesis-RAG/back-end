@@ -263,30 +263,6 @@ def create_domain_rule(
         raise HTTPException(status_code=409, detail=str(exc))
 
 
-# ── Global Rules (domain_id = None) ──────────────────────────────────────────
-
-# List all global rules that apply regardless of domain.
-@router.get("/global-rules", response_model=list[DomainRuleRead])
-def list_global_rules(
-    db: Session = Depends(get_db),
-    _: User = Depends(get_current_user),
-):
-    return policy_service.list_rules(db, domain_id=None)
-
-
-# Create a new global rule (not bound to any domain).
-@router.post("/global-rules", response_model=DomainRuleRead, status_code=201)
-def create_global_rule(
-    payload: DomainRuleCreate,
-    db: Session = Depends(get_db),
-    _: User = Depends(get_current_user),
-):
-    try:
-        return policy_service.create_rule(db, domain_id=None, data=payload)
-    except ValueError as exc:
-        raise HTTPException(status_code=409, detail=str(exc))
-
-
 # ── Rules (update / delete by rule id) ───────────────────────────────────────
 
 # Update an existing rule by its ID.

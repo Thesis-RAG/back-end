@@ -141,18 +141,15 @@ class PolicyRepository:
 
     # ── Rules ─────────────────────────────────────────────────────────────────
 
-    # Return rules for a domain (or global rules when domain_id=None), sorted by priority descending.
-    def list_rules(self, db: Session, domain_id: str | None, *,
+    # Return rules for one domain, sorted by priority descending.
+    def list_rules(self, db: Session, domain_id: str, *,
                    active_only: bool = False) -> list[DomainRule]:
-        if domain_id is None:
-            q = db.query(DomainRule).filter(DomainRule.domain_id.is_(None))
-        else:
-            q = db.query(DomainRule).filter(DomainRule.domain_id == domain_id)
+        q = db.query(DomainRule).filter(DomainRule.domain_id == domain_id)
         if active_only:
             q = q.filter(DomainRule.is_active.is_(True))
         return q.order_by(DomainRule.priority.desc()).all()
 
-    # Load active rules for the given domain codes plus global rules (domain_id=None).
+    # Load active rules for the given domains.
     def get_rules_for_domains(self, db: Session, domain_codes: list[str]) -> list[DomainRule]:
         domain_ids = (
             db.query(PolicyDomain.id)
@@ -164,7 +161,7 @@ class PolicyRepository:
             db.query(DomainRule)
             .filter(
                 DomainRule.is_active.is_(True),
-                (DomainRule.domain_id.in_(ids)) | (DomainRule.domain_id.is_(None)),
+                DomainRule.domain_id.in_(ids),
             )
             .order_by(DomainRule.priority.desc())
             .all()
@@ -183,7 +180,7 @@ class PolicyRepository:
         self,
         db: Session,
         *,
-        domain_id: str | None,
+        domain_id: str,
         rule_code: str,
         name: str,
         action: str,
