@@ -117,11 +117,6 @@ class DomainRuleRead(BaseModel):
     updated_at: datetime
 
 
-class InstallRuleTemplatesRequest(BaseModel):
-    template_codes: list[str] = []  # Empty = install the full recommended bundle.
-    domain_id: str
-
-
 # ── Domains ───────────────────────────────────────────────────────────────────
 
 class PolicyDomainCreate(BaseModel):
