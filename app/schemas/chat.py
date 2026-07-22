@@ -36,6 +36,7 @@ class AssistantMessage(BaseModel):
     content: str
     status: Optional[str]
     createdAt: datetime
+    appliedRules: list[dict] = Field(default_factory=list)
 
 
 class SourceRead(BaseModel):
@@ -95,6 +96,7 @@ class ConversationMessageRead(BaseModel):
     assistantMessage: Optional[AssistantMessage] = None
     traceId: Optional[str] = None
     sources: Optional[list[SourceRead]] = None
+    appliedRules: list[dict] = Field(default_factory=list)
 
 
 class TraceRead(BaseModel):
