@@ -175,10 +175,17 @@ class RuleSelector:
             return {"final_action": "allow", "winning_rule": None, "contract": {}, "reason": "no_whole_chunk_rule"}
 
         whole_resolution = resolve_whole_chunk(whole_chunk_rules)
+
+        # A field-scoped rule must never turn into a whole-chunk decision.
+        # Only an explicitly unscoped BLOCK can discard the complete chunk.
+        # For every other whole-chunk result, keep resolving targeted rules
+        # independently so (for example) a salary deny does not hide an
+        # otherwise allowed person_name entity in the same chunk.
         if scoped_rules and whole_resolution["final_action"] != "block":
             field_rules = []
             for rule in sorted(scoped_rules, key=lambda r: r.priority, reverse=True):
                 field_rules.append({
+                    "scope": "field",
                     "rule_code": rule.rule_code,
                     "name": rule.name,
                     "action": _action(rule),

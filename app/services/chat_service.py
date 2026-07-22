@@ -421,8 +421,15 @@ class ChatService:
         contract = chunk.get("_policy_contract") or {}
         entities = chunk.get("_policy_entities") or []
         field_rules = contract.get("field_rules") or []
+
+        def clear_internal_fields(value: dict) -> dict:
+            cleaned = dict(value)
+            cleaned.pop("_policy_entities", None)
+            cleaned.pop("_needs_field_policy", None)
+            return cleaned
+
         if not text or not field_rules or not entities:
-            return chunk
+            return clear_internal_fields(chunk)
 
         builtin_flags = {
             "email": {"has_pii"}, "phone": {"has_pii"},
@@ -452,10 +459,35 @@ class ChatService:
             if not matches:
                 continue
 
-            if any(str(rule.get("action", "")).lower() == "block" for rule in matches):
+            normalized_actions = {
+                str(rule.get("action") or (rule.get("contract") or {}).get("violation_action") or "allow").lower()
+                for rule in matches
+            }
+
+            # A targeted ALLOW is a no-op for this entity. It must not inherit
+            # the default max_detail=generalize and accidentally redact it.
+            if normalized_actions <= {"allow"}:
+                continue
+
+            if "block" in normalized_actions or "deny" in normalized_actions:
                 replacement = "[ĐÃ ẨN THEO CHÍNH SÁCH]"
             else:
-                rule = max(matches, key=lambda item: detail_order.get(str((item.get("contract") or {}).get("max_detail", "generalize")).lower(), 2))
+                conditional_matches = [
+                    rule for rule in matches
+                    if str(rule.get("action") or (rule.get("contract") or {}).get("violation_action") or "allow").lower()
+                    in {"conditional", "redact", "anonymize", "generalize", "summarize"}
+                ]
+                # Watermark and ALLOW do not rewrite a field. If no
+                # conditional rule remains, preserve the entity as-is.
+                if not conditional_matches:
+                    continue
+                rule = max(
+                    conditional_matches,
+                    key=lambda item: (
+                        detail_order.get(str((item.get("contract") or {}).get("max_detail", "generalize")).lower(), 2),
+                        int(item.get("priority") or 0),
+                    ),
+                )
                 detail = str((rule.get("contract") or {}).get("max_detail", "generalize")).lower()
                 if detail == "redact":
                     replacement = "[ĐÃ ẨN]"
@@ -470,7 +502,7 @@ class ChatService:
             replacements.append((start, end, replacement))
 
         if not replacements:
-            return chunk
+            return clear_internal_fields(chunk)
         # Apply right-to-left and avoid overlapping replacements.
         output = text
         occupied_end = len(text) + 1
@@ -481,9 +513,7 @@ class ChatService:
             occupied_end = start
         result = dict(chunk)
         result["document_text"] = output
-        result.pop("_policy_entities", None)
-        result.pop("_needs_field_policy", None)
-        return result
+        return clear_internal_fields(result)
 
     # Run the policy-contract agent per chunk; return (approved_chunks, contracts).
     # Corp members (admin) bypass all policy constraints.

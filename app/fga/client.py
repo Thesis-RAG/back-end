@@ -2,9 +2,13 @@
 Low-level HTTP client for the OpenFGA authorization service.
 Wraps the /check, /write, /read, and /list-objects REST endpoints.
 """
+import logging
+
 import httpx
 
 from app.core.config import settings
+
+logger = logging.getLogger(__name__)
 
 
 # Thin HTTP wrapper around the OpenFGA API; one instance is shared application-wide.
@@ -28,6 +32,12 @@ class FGAClient:
             resp.raise_for_status()
             return resp.json().get("allowed", False)
         except Exception:
+            logger.exception(
+                "OpenFGA check failed: user=%s relation=%s object=%s",
+                user,
+                relation,
+                object,
+            )
             return False
 
     # Write tuples one-by-one; skip 400 responses (duplicate tuple).
@@ -101,6 +111,12 @@ class FGAClient:
             resp.raise_for_status()
             return resp.json().get("objects", [])
         except Exception:
+            logger.exception(
+                "OpenFGA list_objects failed: user=%s relation=%s type=%s",
+                user,
+                relation,
+                object_type,
+            )
             return []
 
 

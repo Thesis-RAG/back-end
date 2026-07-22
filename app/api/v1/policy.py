@@ -28,15 +28,15 @@ from app.schemas.policy import (
 from app.services.entity_extractor import invalidate_label_cache
 from app.services.policy_agent.domain_classifier import invalidate_domain_cache
 from app.services.policy_service import policy_service
-from app.services.policy_templates import get_policy_template, list_policy_templates
+from app.services.policy_templates import get_policy_templates, list_policy_templates
 
 router = APIRouter()
 
 
 @router.get("/rule-templates")
-def list_rule_templates(_: User = Depends(get_current_user)):
+def list_rule_templates(db: Session = Depends(get_db), _: User = Depends(get_current_user)):
     """Return built-in rules without writing anything to the database."""
-    return list_policy_templates()
+    return list_policy_templates(db)
 
 
 @router.post("/rule-templates/install")
@@ -46,10 +46,14 @@ def install_rule_templates(
     _: User = Depends(get_current_user),
 ):
     """Install selected built-ins as normal editable rules; duplicates are skipped."""
-    codes = payload.template_codes or [item["template_code"] for item in list_policy_templates()]
+    codes = payload.template_codes or [item["template_code"] for item in list_policy_templates(db)]
+    templates = {
+        item["template_code"]: item
+        for item in get_policy_templates(codes, db)
+    }
     created, skipped = [], []
     for code in codes:
-        template = get_policy_template(code)
+        template = templates.get(code.strip().upper())
         if not template:
             raise HTTPException(status_code=404, detail=f"Unknown rule template: {code}")
         rule_data = template["rule"]

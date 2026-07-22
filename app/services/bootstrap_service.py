@@ -1,6 +1,8 @@
 """
 Service for seeding the initial organisational structure and admin user on first startup.
 """
+import logging
+
 from sqlalchemy.orm import Session
 
 from app.core.security import hash_password
@@ -15,11 +17,14 @@ ADMIN_EMAIL  = "admin@rag.com"
 ADMIN_NAME   = "Quản trị viên"
 ADMIN_PASS   = "Admin@123"
 
+logger = logging.getLogger(__name__)
+
 
 class BootstrapService:
     # Create the root OrgUnit, root OUI, Admin position, and the default admin user if none exist.
     def seed_defaults(self, db: Session):
         if db.query(User).count() > 0:
+            self._sync_user_memberships(db)
             return
 
         # 1. Corp. OU
@@ -55,6 +60,21 @@ class BootstrapService:
         ))
 
         db.commit()
+
+        self._sync_user_memberships(db)
+
+    @staticmethod
+    def _sync_user_memberships(db: Session) -> None:
+        """Repair OpenFGA membership tuples for existing DB assignments."""
+        from app.fga.adapter import fga_adapter
+
+        try:
+            synced = fga_adapter.sync_user_memberships(db)
+            logger.info("OpenFGA OUI memberships reconciled: %d", synced)
+        except Exception:
+            # Keep startup available while authorization remains fail-closed;
+            # the admin FGA sync endpoint can retry once OpenFGA is available.
+            logger.exception("Unable to reconcile OpenFGA OUI memberships")
 
 
 # Module-level singleton; imported by the startup lifespan handler.

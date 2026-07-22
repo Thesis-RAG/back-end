@@ -36,6 +36,7 @@ def reload_rules(db: Session = Depends(get_db), current_user: User = Depends(get
 @router.post("/fga/sync")
 def sync_fga(db: Session = Depends(get_db), current_user: User = Depends(get_current_user)):
     require_admin(current_user, db)
+    membership_synced = fga_adapter.sync_user_memberships(db)
     docs = db.query(DocumentModel).filter(DocumentModel.status == "approved").all()
     synced = 0
     errors = 0
@@ -47,7 +48,12 @@ def sync_fga(db: Session = Depends(get_db), current_user: User = Depends(get_cur
             synced += 1
         except Exception:
             errors += 1
-    return {"status": "ok", "synced": synced, "errors": errors}
+    return {
+        "status": "ok",
+        "membership_synced": membership_synced,
+        "documents_synced": synced,
+        "errors": errors,
+    }
 
 
 # Queue a full document reindex (placeholder — returns ok immediately).
