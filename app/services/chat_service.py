@@ -26,6 +26,7 @@ from app.repositories.trace_repository import TraceRepository
 from app.services.answer_service import answer_service
 from app.services.audit_service import audit_service
 from app.services.guard_service import guard_service
+from app.services.guard_service import sanitize_masked_markers
 from app.services.intent_classifier import intent_classifier
 from app.services.llm_service import llm_service
 from app.services.memory_service import memory_service
@@ -42,6 +43,30 @@ POLICY_ENABLED = True
 DONE_STATUSES = {"success", "fallback", "no_answer", "llm_error", "blocked"}
 
 logger = logging.getLogger(__name__)
+
+
+def _safe_stream_fragment(buffer: str, fragment: str, *, final: bool = False) -> tuple[str, list[str]]:
+    """Emit completed lines after removing internal redaction markers.
+
+    Keeping an incomplete line buffered prevents a marker split across model
+    tokens from reaching the client. Table rows containing a masked value are
+    omitted entirely.
+    """
+    buffer += fragment
+    parts = buffer.split("\n")
+    remainder = parts.pop() if not final else ""
+    if final and parts == [] and buffer:
+        parts = [buffer]
+
+    emitted: list[str] = []
+    for line in parts:
+        cleaned = sanitize_masked_markers(line, drop_masked_lines=True)
+        if cleaned:
+            emitted.append(cleaned + "\n")
+
+    if final:
+        remainder = ""
+    return remainder, emitted
 
 CHATBOT_SYSTEM_PROMPT = """
 Bạn là trợ lý AI thông minh, thân thiện như ChatGPT, Gemini, Claude.
@@ -499,6 +524,9 @@ class ChatService:
                     replacement = "[GIÁ TRỊ TÀI CHÍNH ĐÃ KHÁI QUÁT]"
                 else:
                     replacement = "[THÔNG TIN CÁ NHÂN ĐÃ KHÁI QUÁT]"
+            # Keep field redaction user-facing and never expose internal
+            # bracketed entity labels in the answer context.
+            replacement = "giá trị đã được ẩn theo chính sách"
             replacements.append((start, end, replacement))
 
         if not replacements:
@@ -880,8 +908,10 @@ class ChatService:
 
     # Guard 3: post-LLM PII and secret scan; returns (possibly redacted) answer text.
     def _apply_guard3(self, answer_text: str, user, tid: str) -> str:
-        if not (GUARDS_ENABLED and answer_text):
+        if not answer_text:
             return answer_text
+        if not GUARDS_ENABLED:
+            return sanitize_masked_markers(answer_text, drop_masked_lines=True)
 
         post_scan = guard_service.scan_response(answer_text, user=user)
 
@@ -898,7 +928,7 @@ class ChatService:
             logger.warning("Guard3 POST-LLM: has_pii=%s has_secret=%s trace_id=%s",
                            post_scan.has_pii, post_scan.has_secret, tid)
 
-        return answer_text
+        return sanitize_masked_markers(answer_text, drop_masked_lines=True)
 
     # ------------------------------------------------------------------
     # list_messages_flat
@@ -1289,6 +1319,7 @@ class ChatService:
                         api_messages.append({"role": h["role"], "content": content})
                     api_messages.append({"role": "user", "content": (llm_extra_context + effective_query).strip()})
 
+                    stream_buffer = ""
                     for token in llm_service.generate_stream(
                         messages=api_messages,
                         max_tokens=1024,
@@ -1296,7 +1327,13 @@ class ChatService:
                         system=CHATBOT_SYSTEM_PROMPT,
                     ):
                         full_text += token
-                        yield {"type": "token", "text": token}
+                        stream_buffer, safe_parts = _safe_stream_fragment(stream_buffer, token)
+                        for safe_part in safe_parts:
+                            yield {"type": "token", "text": safe_part}
+
+                    _, safe_parts = _safe_stream_fragment(stream_buffer, "", final=True)
+                    for safe_part in safe_parts:
+                        yield {"type": "token", "text": safe_part}
 
                     full_text = re.sub(r"<think>.*?</think>", "", full_text, flags=re.DOTALL).strip()
 
@@ -1358,9 +1395,16 @@ class ChatService:
                     )
                     logger.info("LLM stream prompt trace_id=%s", tid)
 
+                    stream_buffer = ""
                     for token in llm_service.generate_stream(prompt=prompt, max_tokens=2048):
                         full_text += token
-                        yield {"type": "token", "text": token}
+                        stream_buffer, safe_parts = _safe_stream_fragment(stream_buffer, token)
+                        for safe_part in safe_parts:
+                            yield {"type": "token", "text": safe_part}
+
+                    _, safe_parts = _safe_stream_fragment(stream_buffer, "", final=True)
+                    for safe_part in safe_parts:
+                        yield {"type": "token", "text": safe_part}
 
                     full_text = re.sub(r"<think>.*?</think>", "", full_text, flags=re.DOTALL).strip()
                     logger.info("LLM stream result len=%d", len(full_text))

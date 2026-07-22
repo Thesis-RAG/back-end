@@ -11,6 +11,7 @@ from typing import Any
 import httpx
 
 from app.core.config import settings
+from app.services.guard_service import sanitize_masked_markers
 from app.services.prompt_injection_guard import prompt_injection_guard
 
 try:
@@ -105,6 +106,8 @@ class LLMService:
             doc_text = (ctx.get("document_text") or "").strip()
             if not doc_text:
                 continue
+            # Redaction markers are internal metadata, not answer content.
+            doc_text = sanitize_masked_markers(doc_text)
 
             score = ctx.get("score")
             chunk_id = ctx.get("chunk_id")
@@ -159,7 +162,15 @@ YÊU CẦU TRẢ LỜI
 - Không bắt đầu bằng "Dựa trên ngữ cảnh..." hay các cụm mở đầu thừa.
 - Nếu ngữ cảnh có chuỗi các bước nối bằng →, trình bày lại dưới dạng danh sách có số thứ tự, không copy nguyên chuỗi dài.
 - Giữ nguyên định dạng markdown từ ngữ cảnh: **in đậm**, *in nghiêng*, | bảng |, danh sách. Khi trích dẫn nội dung dạng bảng, sao chép nguyên bảng; không chuyển thành văn xuôi.
-""".strip()
+        """.strip()
+
+        prompt += (
+            "\n\nANSWER SAFETY AND FOCUS\n"
+            "- Answer only the fields explicitly requested by the user; do not copy unrelated tables or sections.\n"
+            "- Redaction markers such as [PERSON_NAME], [SALARY_AMOUNT], [EMAIL_ADDRESS] or [BANK_ACCOUNT] are internal metadata. Never print, enumerate or explain those markers.\n"
+            "- If a requested value is redacted, omit that value or say briefly that it is hidden by policy. Never infer or recreate it.\n"
+            "- Do not mention that you removed markers and do not list the hidden fields.\n"
+        )
 
         if extra_instructions and extra_instructions.strip():
             prompt += f"\n\nGHI CHÚ BỔ SUNG\n{extra_instructions.strip()}"

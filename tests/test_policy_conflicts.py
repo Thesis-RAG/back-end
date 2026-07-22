@@ -105,7 +105,8 @@ def test_field_allow_keeps_person_name_while_salary_is_masked():
 
     assert "Nguyen Van A" in result["document_text"]
     assert "30 trieu" not in result["document_text"]
-    assert "[ĐÃ ẨN THEO CHÍNH SÁCH]" in result["document_text"]
+    assert "giá trị đã được ẩn theo chính sách" in result["document_text"]
+    assert "[" not in result["document_text"]
     assert "_policy_entities" not in result
     assert "_needs_field_policy" not in result
 
