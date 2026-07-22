@@ -334,6 +334,8 @@ class PolicyContractAgent:
                     "domain":     r.domain_code,
                     "name":       r.name,
                     "action":     r.contract.get("violation_action", r.action),
+                    "scope":      "field" if (r.target_entity_types or r.target_flags) else "chunk",
+                    "priority":   r.priority,
                     "score":      r.score,
                     "reasons":    r.reasons,
                     "target_entity_types": r.target_entity_types,

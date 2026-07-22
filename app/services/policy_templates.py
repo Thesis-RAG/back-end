@@ -7,7 +7,18 @@ editable DomainRule; it is never a hidden or immutable policy.
 """
 from __future__ import annotations
 
+import json
+import logging
+import re
+from threading import Lock
+
+from app.repositories.policy_repository import policy_repository
 from app.schemas.policy import DomainRuleCreate, RuleConditions, RuleContract
+from app.services.entity_extractor import REGEX_PATTERNS
+from app.services.llm_service import llm_service
+from app.services.policy_service import BOOLEAN_FLAGS
+
+logger = logging.getLogger(__name__)
 
 
 def _template(
@@ -40,6 +51,159 @@ def _template(
             contract=contract,
         ),
     }
+
+
+# The hard-coded scopes inside BUILT_IN_RULE_TEMPLATES are retained as a safe
+# fallback for installations without a configured LLM. In normal operation,
+# scopes are regenerated from each template's meaning and validated against
+# the entity vocabulary used by the extractor.
+_SCOPE_CACHE: dict[tuple[str, tuple[str, ...]], dict[str, list[str]]] = {}
+_SCOPE_CACHE_LOCK = Lock()
+
+
+def _available_entity_types(db=None) -> list[str]:
+    """Return entity labels the policy engine can actually detect."""
+    labels = set(REGEX_PATTERNS)
+    if db is not None:
+        try:
+            labels.update(
+                str(item.entity_type).strip().lower()
+                for item in policy_repository.get_all_active_entity_types(db)
+                if item.entity_type
+            )
+        except Exception as exc:
+            logger.warning("Could not load active entity labels for rule templates: %s", exc)
+    return sorted(labels)
+
+
+def _scope_cache_key(template_code: str, entity_types: list[str]) -> tuple[str, tuple[str, ...]]:
+    return template_code, tuple(entity_types)
+
+
+def _normalize_scope(raw: object, allowed_entity_types: set[str]) -> dict[str, list[str]] | None:
+    if not isinstance(raw, dict):
+        return None
+
+    def normalize_values(values: object, allowed: set[str]) -> list[str]:
+        if not isinstance(values, list):
+            return []
+        result = []
+        for value in values:
+            normalized = str(value).strip().lower().replace("-", "_").replace(" ", "_")
+            if normalized in allowed and normalized not in result:
+                result.append(normalized)
+        return result
+
+    return {
+        "target_entity_types": normalize_values(raw.get("target_entity_types"), allowed_entity_types),
+        "target_flags": normalize_values(raw.get("target_flags"), set(BOOLEAN_FLAGS)),
+    }
+
+
+def _parse_scope_response(text: str) -> dict[str, object]:
+    """Parse the bounded JSON response returned by the scope-generation LLM."""
+    match = re.search(r"\{[\s\S]*\}", text or "")
+    if not match:
+        raise ValueError("LLM did not return a JSON object")
+    payload = json.loads(match.group(0))
+    if not isinstance(payload, dict):
+        raise ValueError("LLM scope response is not an object")
+    scopes = payload.get("scopes", payload)
+    if isinstance(scopes, list):
+        return {
+            str(item.get("template_code")): item
+            for item in scopes
+            if isinstance(item, dict) and item.get("template_code")
+        }
+    if isinstance(scopes, dict):
+        return scopes
+    raise ValueError("LLM scope response has no scopes")
+
+
+def _generate_scopes(templates: list[dict], entity_types: list[str]) -> None:
+    """Generate and cache field scopes for templates in one LLM request."""
+    if not templates:
+        return
+    if not llm_service.is_configured():
+        return
+
+    missing = [
+        item for item in templates
+        if _scope_cache_key(item["template_code"], entity_types) not in _SCOPE_CACHE
+    ]
+    if not missing:
+        return
+
+    template_catalog = [
+        {
+            "template_code": item["template_code"],
+            "name": item["name"],
+            "description": item["description"],
+            "category": item["category"],
+            "department": item["department"],
+            "document_types": item["document_types"],
+            "violation_action": item["rule"].contract.violation_action,
+        }
+        for item in missing
+    ]
+    prompt = (
+        "You are designing precise field scopes for enterprise data-governance rules.\n"
+        "For every template below, decide which detected entity types and boolean flags "
+        "the rule should target. Do not copy the same broad scope to every rule.\n\n"
+        "Rules:\n"
+        "- target_entity_types must contain only labels from the allowed entity list.\n"
+        "- target_flags must contain only flags from the allowed flag list.\n"
+        "- Use [] for both arrays when the rule applies to the complete chunk/document, "
+        "such as classification or cross-department controls.\n"
+        "- Choose the narrowest scope supported by the rule meaning. For example, a salary "
+        "rule should target money/salary entities, not every PII entity.\n"
+        "- Return JSON only in this shape: "
+        "{\"scopes\": {\"TEMPLATE_CODE\": "
+        "{\"target_entity_types\": [], \"target_flags\": []}}}\n\n"
+        f"Allowed entity types:\n{json.dumps(entity_types, ensure_ascii=False)}\n\n"
+        f"Allowed flags:\n{json.dumps(BOOLEAN_FLAGS, ensure_ascii=False)}\n\n"
+        f"Templates:\n{json.dumps(template_catalog, ensure_ascii=False)}"
+    )
+
+    try:
+        text, _, _ = llm_service.generate(
+            prompt=prompt,
+            system=(
+                "Return only valid JSON. Never invent entity types or flags. "
+                "A blank scope is valid when a rule applies to the whole chunk."
+            ),
+            max_tokens=1536,
+            temperature=0.0,
+        )
+        raw_scopes = _parse_scope_response(text)
+        allowed_entity_types = set(entity_types)
+        generated: dict[tuple[str, tuple[str, ...]], dict[str, list[str]]] = {}
+        for item in missing:
+            raw_scope = raw_scopes.get(item["template_code"])
+            scope = _normalize_scope(raw_scope, allowed_entity_types)
+            if scope is not None:
+                generated[_scope_cache_key(item["template_code"], entity_types)] = scope
+        with _SCOPE_CACHE_LOCK:
+            _SCOPE_CACHE.update(generated)
+        logger.info("Generated LLM scopes for %d policy templates", len(generated))
+    except Exception as exc:
+        # Keep the built-in scope as fallback; template listing/install remains
+        # available when the external model is unavailable or returns invalid JSON.
+        logger.warning("Rule-template scope generation failed; using fallback scopes: %s", exc)
+
+
+def _materialize_templates(templates: list[dict], db=None) -> list[dict]:
+    entity_types = _available_entity_types(db)
+    _generate_scopes(templates, entity_types)
+    result = []
+    for item in templates:
+        rule = item["rule"].model_copy(deep=True)
+        generated_scope = _SCOPE_CACHE.get(_scope_cache_key(item["template_code"], entity_types))
+        if generated_scope is not None:
+            conditions = rule.conditions.model_copy(update=generated_scope)
+            rule = rule.model_copy(update={"conditions": conditions})
+        result.append({**item, "rule": rule})
+    return result
 
 
 BUILT_IN_RULE_TEMPLATES: list[dict] = [
@@ -199,7 +363,9 @@ BUILT_IN_RULE_TEMPLATES: list[dict] = [
 ]
 
 
-def list_policy_templates() -> list[dict]:
+def list_policy_templates(db=None) -> list[dict]:
+    """Return templates with LLM-generated scopes when available."""
+    templates = _materialize_templates(BUILT_IN_RULE_TEMPLATES, db)
     return [
         {
             "template_code": item["template_code"],
@@ -211,10 +377,19 @@ def list_policy_templates() -> list[dict]:
             "recommended": item["recommended"],
             "rule": item["rule"].model_dump(),
         }
-        for item in BUILT_IN_RULE_TEMPLATES
+        for item in templates
     ]
 
 
-def get_policy_template(code: str) -> dict | None:
-    normalized = code.strip().upper()
-    return next((item for item in BUILT_IN_RULE_TEMPLATES if item["template_code"] == normalized), None)
+def get_policy_templates(codes: list[str], db=None) -> list[dict]:
+    normalized = {code.strip().upper() for code in codes}
+    selected = [
+        item for item in BUILT_IN_RULE_TEMPLATES
+        if item["template_code"] in normalized
+    ]
+    return _materialize_templates(selected, db)
+
+
+def get_policy_template(code: str, db=None) -> dict | None:
+    materialized = get_policy_templates([code], db)
+    return materialized[0] if materialized else None

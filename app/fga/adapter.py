@@ -53,6 +53,24 @@ class FGAAdapter:
             {"user": f"user:{user_id}", "relation": "member", "object": f"oui:{oui_id}"}
         ])
 
+    # Reconcile persisted OUI assignments into OpenFGA membership tuples.
+    # This repairs bootstrap/migration assignments that bypassed the API.
+    def sync_user_memberships(self, db: Session) -> int:
+        from app.models.user_oui_position import UserOuiPosition
+
+        assignments = db.query(UserOuiPosition).all()
+        tuples = [
+            {
+                "user": f"user:{assignment.user_id}",
+                "relation": "member",
+                "object": f"oui:{assignment.oui_id}",
+            }
+            for assignment in assignments
+        ]
+        if tuples:
+            fga_client.write(tuples)
+        return len(tuples)
+
     # Write a parent_oui tuple linking oui_id as a child of parent_oui_id.
     def link_oui_parent(self, oui_id: str, parent_oui_id: str) -> None:
         fga_client.write([
