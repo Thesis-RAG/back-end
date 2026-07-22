@@ -14,8 +14,18 @@ depends_on = None
 
 
 def upgrade():
-    op.add_column('messages', sa.Column('attached_file_name', sa.String(512), nullable=True))
+    # The initial migration creates tables from the current SQLAlchemy
+    # metadata. On a fresh database, this column may therefore already exist
+    # before revision 005 is reached. Keep the migration safe for both fresh
+    # and upgraded installations.
+    bind = op.get_bind()
+    columns = {column["name"] for column in sa.inspect(bind).get_columns("messages")}
+    if "attached_file_name" not in columns:
+        op.add_column("messages", sa.Column("attached_file_name", sa.String(512), nullable=True))
 
 
 def downgrade():
-    op.drop_column('messages', 'attached_file_name')
+    bind = op.get_bind()
+    columns = {column["name"] for column in sa.inspect(bind).get_columns("messages")}
+    if "attached_file_name" in columns:
+        op.drop_column("messages", "attached_file_name")
