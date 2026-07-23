@@ -1,10 +1,10 @@
 """
 Hybrid entity extraction pipeline with three layers:
   Layer 1 (Regex)  — structured PII (email, phone, national_id, ...)
-  Layer 2 (GLiNER) — free-text entities from labels defined in active DB domains
+  Layer 2 (GLiNER) — free-text entities from the shared baseline and file actions
   Layer 3 (Rule)   — boolean summary labels and chunk sensitivity scoring
 
-Boolean flags (fixed vocabulary, defined in policy_service.BOOLEAN_FLAGS):
+Boolean flags (fixed vocabulary used for sensitivity metadata):
   has_pii        — personal identifiable information
   has_financial  — financial / quantitative business data
   has_credential — authentication secrets (passwords, tokens, API keys)
@@ -14,7 +14,7 @@ Boolean flags (fixed vocabulary, defined in policy_service.BOOLEAN_FLAGS):
 
 Entity type → flag mapping:
   Regex-detected types → hardcoded _BUILTIN_ENTITY_FLAGS
-  GLiNER-detected types → loaded from domain_entity_types.boolean_labels
+  GLiNER-detected types → loaded from document entity-action metadata
   Both are merged into a single TTL cache refreshed every 5 minutes.
 """
 from __future__ import annotations
@@ -68,6 +68,31 @@ _BUILTIN_ENTITY_FLAGS: dict[str, list[str]] = {
     "credential":       ["has_credential"],
 }
 
+# Available before a newly uploaded file has persisted action rows. This is
+# the shared baseline used by upload preview, ingestion, and query detection.
+_DEFAULT_GLINER_LABELS: tuple[str, ...] = (
+    "person_name", "organization", "address", "salary", "money", "project",
+    "contract", "email", "phone", "account_number", "credential", "date",
+)
+
+_DEFAULT_GLINER_FLAGS: dict[str, list[str]] = {
+    "person_name": ["has_pii"],
+    "address": ["has_pii"],
+    "salary": ["has_financial", "has_hr"],
+    "project": ["has_strategic"],
+    "contract": ["has_legal"],
+    "account_number": ["has_pii", "has_financial"],
+}
+
+# Only these entity types are safe enough to justify lowering a chunk's
+# sensitivity. This is intentionally a very small allowlist: a missing
+# sensitive entity must never turn a chunk into a less protected one.
+COMMON_PUBLIC_ENTITY_TYPES = frozenset({"date", "date_generic"})
+SENSITIVITY_PROTECTIVE_FLAGS = frozenset({
+    "has_pii", "has_financial", "has_credential", "has_legal",
+    "has_strategic", "has_hr",
+})
+
 # Keyword-based augmentation: catches in-text patterns GLiNER might miss
 _CREDENTIAL_RE = re.compile(r"(?i)\b(mật khẩu|password|api[_\s]?key|token|secret|otp)\b")
 _LEGAL_RE      = re.compile(r"(?i)\b(nghị định|thông tư|điều\s+\d+|luật|hợp đồng|quyết định số)\b")
@@ -88,11 +113,68 @@ _FLAG_SENSITIVITY_WEIGHTS: dict[str, int] = {
 # Derive chunk-level sensitivity from doc sensitivity and detected boolean flags; result clamped to [1, 5].
 def compute_chunk_sensitivity(doc_sensitivity: int, labels: dict[str, bool]) -> int:
     if not any(labels.values()):
-        delta = -1
+        # No entity evidence means no downgrade.  Lowering is handled by
+        # adjust_chunk_sensitivity and requires the strict public allowlist.
+        delta = 0
     else:
         raw = sum(_FLAG_SENSITIVITY_WEIGHTS.get(f, 0) for f, v in labels.items() if v)
         delta = min(raw, 2)
     return max(1, min(5, doc_sensitivity + delta))
+
+
+def _normalize_entity_label(value: object) -> str:
+    return re.sub(r"[^a-z0-9_]+", "_", str(value or "").strip().lower()).strip("_")
+
+
+def has_common_public_entity(
+    entities: list[dict] | None,
+    flags: set[str] | dict[str, bool] | None = None,
+) -> bool:
+    """Return whether a chunk is safe enough for the one-level reduction."""
+    detected = [
+        entity for entity in (entities or [])
+        if _normalize_entity_label(entity.get("label"))
+    ]
+    if not detected:
+        return False
+
+    labels = {_normalize_entity_label(entity.get("label")) for entity in detected}
+    if not labels.issubset(COMMON_PUBLIC_ENTITY_TYPES):
+        return False
+    # The downgrade must be based on GLiNER evidence, not only a regex hit.
+    if not any(str(entity.get("source") or "").lower() == "gliner" for entity in detected):
+        return False
+
+    if isinstance(flags, dict):
+        active_flags = {key for key, value in flags.items() if value}
+    else:
+        active_flags = set(flags or set())
+    return not (active_flags & SENSITIVITY_PROTECTIVE_FLAGS)
+
+
+def adjust_chunk_sensitivity(
+    doc_sensitivity: int,
+    original_chunk_sensitivity: int | None,
+    entities: list[dict] | None = None,
+    flags: set[str] | dict[str, bool] | None = None,
+) -> int:
+    """Apply GLiNER lowering without weakening the existing raise logic.
+
+    The original value is produced by the existing chunker/LLM logic. Values
+    above the document level are preserved exactly. Values below or equal to
+    the document level are lowered only for the strict common-public-entity
+    case; otherwise they are restored to the document level.
+    """
+    document_level = max(1, min(5, int(doc_sensitivity or 1)))
+    original = document_level if original_chunk_sensitivity is None else max(
+        1, min(5, int(original_chunk_sensitivity))
+    )
+
+    if original > document_level:
+        return original
+    if has_common_public_entity(entities, flags):
+        return max(1, document_level - 1)
+    return document_level
 
 
 # ── Combined entity cache (labels + flag mapping) ─────────────────────────────
@@ -113,21 +195,32 @@ def _refresh_cache(db=None) -> tuple[list[str], dict[str, list[str]]]:
         return _cache["labels"], _cache["flags"]
 
     if db is None:
-        return _cache.get("labels", []), _cache.get("flags", dict(_BUILTIN_ENTITY_FLAGS))
+        return (
+            _cache.get("labels", list(_DEFAULT_GLINER_LABELS)),
+            _cache.get("flags", {**_BUILTIN_ENTITY_FLAGS, **_DEFAULT_GLINER_FLAGS}),
+        )
 
     with _cache_lock:
         # Double-check after acquiring lock
         if now - _cache_ts < _CACHE_TTL and _cache:
             return _cache["labels"], _cache["flags"]
         try:
-            from app.repositories.policy_repository import policy_repository
-            entity_types = policy_repository.get_all_active_entity_types(db)
+            from app.models.document_entity_action import DocumentEntityAction
+            rows = (
+                db.query(DocumentEntityAction.entity_type, DocumentEntityAction.metadata_json)
+                .filter(DocumentEntityAction.enabled.is_(True))
+                .all()
+            )
 
-            labels = list({et.entity_type for et in entity_types})
-            db_flags = {et.entity_type: (et.boolean_labels or []) for et in entity_types}
+            labels = sorted({*(_DEFAULT_GLINER_LABELS), *(str(entity_type) for entity_type, _ in rows if entity_type)})
+            db_flags = {
+                str(entity_type): list((metadata or {}).get("boolean_labels") or [])
+                for entity_type, metadata in rows
+                if entity_type
+            }
 
             # Builtins are baseline; DB values override if same key exists
-            combined_flags = {**_BUILTIN_ENTITY_FLAGS, **db_flags}
+            combined_flags = {**_BUILTIN_ENTITY_FLAGS, **_DEFAULT_GLINER_FLAGS, **db_flags}
 
             _cache = {"labels": labels, "flags": combined_flags}
             _cache_ts = now
@@ -138,7 +231,10 @@ def _refresh_cache(db=None) -> tuple[list[str], dict[str, list[str]]]:
         except Exception as exc:
             logger.warning("Failed to refresh entity cache: %s", exc)
 
-    return _cache.get("labels", []), _cache.get("flags", dict(_BUILTIN_ENTITY_FLAGS))
+    return (
+        _cache.get("labels", list(_DEFAULT_GLINER_LABELS)),
+        _cache.get("flags", {**_BUILTIN_ENTITY_FLAGS, **_DEFAULT_GLINER_FLAGS}),
+    )
 
 
 # Force a cache refresh on the next call; invoke after creating or deleting entity types.
@@ -161,8 +257,9 @@ def _get_gliner():
             if _gliner_model is None:
                 try:
                     from gliner import GLiNER
-                    logger.info("Loading GLiNER model urchade/gliner_multi-v2.1 ...")
-                    _gliner_model = GLiNER.from_pretrained("urchade/gliner_multi-v2.1")
+                    from app.core.config import settings
+                    logger.info("Loading GLiNER model %s ...", settings.gliner_model_name)
+                    _gliner_model = GLiNER.from_pretrained(settings.gliner_model_name)
                     logger.info("GLiNER model loaded.")
                 except Exception as exc:
                     logger.error("Failed to load GLiNER: %s", exc)

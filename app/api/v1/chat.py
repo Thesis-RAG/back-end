@@ -28,6 +28,7 @@ from app.schemas.chat import (
 from app.services.chat_service import chat_service
 from app.services.llm_service import llm_service
 from app.services.retrieval_service import retrieval_service
+from app.services.entity_policy_service import entity_policy_service
 
 logger = logging.getLogger(__name__)
 
@@ -189,6 +190,10 @@ def search_documents(
     results = retrieval_service.retrieve(
         query=query, user=current_user, top_k=top_k, mode=mode, db=db
     )
+    if not entity_policy_service.bypasses_entity_actions(current_user):
+        results, _contracts = entity_policy_service.apply_to_retrieved(
+            db, current_user, query, results
+        )
 
     # Enrich document_type from DB for chunks whose Chroma metadata still has "general".
     stale_doc_ids = {
@@ -232,6 +237,7 @@ def generate_title(
             max_tokens=30,
             temperature=0.3,
             fallback_to_ollama=False,
+            include_markdown_instructions=False,
         )
         title = (title or "").strip().strip('"').strip("'")
         if not title:

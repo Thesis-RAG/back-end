@@ -23,6 +23,8 @@ from sqlalchemy.orm import Session
 from app.core.deps import get_current_user, get_db
 from app.models.document import Document
 from app.models.document_access_request import DocumentAccessRequest
+from app.models.document_entity_access_request import DocumentEntityAccessRequest
+from app.models.document_version import DocumentVersion
 from app.models.user import User
 from app.services.chroma_service import chroma_service
 from app.repositories.document_access_request_repository import doc_access_request_repo
@@ -34,6 +36,12 @@ from app.schemas.document_access_request import (
     DocumentAccessStatus,
 )
 from app.services.user_service import user_service as _user_service
+from app.repositories.document_entity_repository import document_entity_repository
+from app.schemas.document_entity_access_request import (
+    EntityAccessRequestCreate,
+    EntityAccessRequestRead,
+)
+from app.services.entity_policy_service import entity_policy_service, normalize_entity_type
 
 router = APIRouter()
 
@@ -77,6 +85,27 @@ def _build_read(db: Session, obj: DocumentAccessRequest) -> AccessRequestRead:
         admin_note           = obj.admin_note,
         created_at           = obj.created_at,
         resolved_at          = obj.resolved_at,
+    )
+
+
+def _build_entity_read(db: Session, obj: DocumentEntityAccessRequest) -> EntityAccessRequestRead:
+    doc = db.get(Document, obj.document_id)
+    requester = db.get(User, obj.user_id)
+    return EntityAccessRequestRead(
+        id=obj.id,
+        document_id=obj.document_id,
+        document_version_id=obj.document_version_id,
+        document_title=doc.title if doc else None,
+        user_id=obj.user_id,
+        requester_name=(getattr(requester, "name", None) or getattr(requester, "email", None)) if requester else None,
+        requester_email=getattr(requester, "email", None) if requester else None,
+        entity_types=list(obj.entity_types_json or []),
+        status=obj.status,
+        expires_at=obj.expires_at,
+        admin_id=obj.admin_id,
+        admin_note=obj.admin_note,
+        created_at=obj.created_at,
+        resolved_at=obj.resolved_at,
     )
 
 
@@ -225,3 +254,103 @@ def get_document_access_status(
         access_request_status = status,
         approved_until        = approved_until,
     )
+
+
+# ── Entity-level access requests ────────────────────────────────────────────
+
+@router.post("/entity-access-requests", response_model=EntityAccessRequestRead, status_code=201)
+def create_entity_access_request(
+    payload: EntityAccessRequestCreate,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    version = db.get(DocumentVersion, payload.document_version_id)
+    if not version or version.document_id != payload.document_id:
+        raise HTTPException(status_code=404, detail="Document version not found")
+
+    blocked = entity_policy_service.blocked_types_for_version(
+        db, version.id, current_user
+    )
+    requested = {normalize_entity_type(value) for value in payload.entity_types}
+    requested = requested.intersection(blocked)
+    if not requested:
+        raise HTTPException(status_code=400, detail="No blocked entity requested")
+    if entity_policy_service.has_entity_access(
+        db, current_user, payload.document_id, payload.document_version_id, requested
+    ):
+        raise HTTPException(status_code=409, detail="Entity access already granted")
+    if document_entity_repository.has_pending(
+        db, str(current_user.id), payload.document_id, payload.document_version_id, list(requested)
+    ):
+        raise HTTPException(status_code=409, detail="Entity access request already pending")
+
+    obj = document_entity_repository.create_access_request(
+        db,
+        document_id=payload.document_id,
+        version_id=payload.document_version_id,
+        user_id=str(current_user.id),
+        entity_types=sorted(requested),
+    )
+    db.commit()
+    return _build_entity_read(db, obj)
+
+
+@router.get("/entity-access-requests/my", response_model=list[EntityAccessRequestRead])
+def my_entity_access_requests(
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    return [
+        _build_entity_read(db, row)
+        for row in document_entity_repository.list_requests(db, user_id=str(current_user.id))
+    ]
+
+
+@router.get("/entity-access-requests", response_model=list[EntityAccessRequestRead])
+def list_entity_access_requests(
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    if not _is_corp_member(db, current_user):
+        raise HTTPException(status_code=403, detail="Forbidden")
+    return [_build_entity_read(db, row) for row in document_entity_repository.list_requests(db)]
+
+
+@router.put("/entity-access-requests/{request_id}/approve", response_model=EntityAccessRequestRead)
+def approve_entity_access_request(
+    request_id: str,
+    payload: AccessRequestApprove,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    if not _is_corp_member(db, current_user):
+        raise HTTPException(status_code=403, detail="Forbidden")
+    try:
+        obj = document_entity_repository.resolve(
+            db, request_id, status="approved", admin_id=str(current_user.id),
+            admin_note=payload.admin_note, expires_at=payload.expires_at,
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    db.commit()
+    return _build_entity_read(db, obj)
+
+
+@router.put("/entity-access-requests/{request_id}/reject", response_model=EntityAccessRequestRead)
+def reject_entity_access_request(
+    request_id: str,
+    payload: AccessRequestReject,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    if not _is_corp_member(db, current_user):
+        raise HTTPException(status_code=403, detail="Forbidden")
+    try:
+        obj = document_entity_repository.resolve(
+            db, request_id, status="rejected", admin_id=str(current_user.id),
+            admin_note=payload.admin_note,
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    db.commit()
+    return _build_entity_read(db, obj)

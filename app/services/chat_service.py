@@ -1,6 +1,6 @@
 """
 Chat orchestration service: non-streaming and streaming RAG pipeline,
-prompt-injection detection, and policy-contract transformations.
+prompt-injection detection, and per-entity access enforcement.
 """
 from __future__ import annotations
 
@@ -28,10 +28,9 @@ from app.services.answer_service import answer_service
 from app.services.audit_service import audit_service
 from app.services.guard_service import guard_service
 from app.services.guard_service import sanitize_masked_markers
-from app.services.intent_classifier import intent_classifier
 from app.services.llm_service import llm_service
 from app.services.memory_service import memory_service
-from app.services.policy_agent import policy_contract_agent
+from app.services.entity_policy_service import entity_policy_service
 from app.services.prompt_injection_guard import prompt_injection_guard
 from app.services.retrieval_service import retrieval_service
 from app.utils.markdown_tables import normalize_markdown_tables
@@ -41,7 +40,7 @@ from app.utils.status_answer import is_no_answer
 # not performed by a guard; policy rules are the single source of truth for
 # hiding retrieved fields and answer content.
 PROMPT_GUARD_ENABLED = True
-# Toggle policy-contract per-chunk enforcement.
+# Toggle per-entity enforcement at the retrieval boundary.
 POLICY_ENABLED = True
 # Terminal assistant message statuses considered complete for listing.
 DONE_STATUSES = {"success", "fallback", "no_answer", "llm_error", "blocked"}
@@ -95,8 +94,6 @@ _BLOCK_MESSAGES = {
 # Policy — shared notice string
 # ------------------------------------------------------------------------------
 
-_POLICY_NOTICE = "[Nội dung này đã được ẩn theo chính sách phân quyền.]"
-
 _HIDDEN_OUTPUT_RE = re.compile(
     r"(?:"
     r"\[(?:PERSON_NAME|EMAIL_ADDRESS|PHONE_NUMBER|ADDRESS|SALARY_AMOUNT|"
@@ -128,6 +125,10 @@ Nhiệm vụ:
    TRỊ BỊ BẢO VỆ cho biết field đó bị policy hạn chế. Nếu không có policy
    hạn chế tương ứng, không được tự ý che số điện thoại, lương hoặc số liệu
    mà người dùng đã hỏi.
+6. Giá trị của trường "answer" phải giữ Markdown hợp lệ: dùng danh sách cho
+   các ý song song, bảng Markdown có hàng tiêu đề và hàng phân cách khi thật
+   sự phù hợp, mỗi hàng bảng nằm trên một dòng riêng, không bọc toàn bộ câu
+   trả lời trong code fence và giữ nguyên citation [N].
 
 Chỉ trả về JSON hợp lệ theo dạng:
 {"answer":"...","keep_citations":[1,2]}
@@ -137,6 +138,15 @@ Chỉ trả về JSON hợp lệ theo dạng:
 # Return the user-facing block message for the given Guard 1 classification.
 def _block_message(class_: str) -> str:
     return _BLOCK_MESSAGES.get(class_, _BLOCK_MESSAGES["_DEFAULT"])
+
+
+def _question_only_history(history: list[dict] | None) -> list[dict]:
+    """Keep only prior user questions for follow-up query rewriting."""
+    return [
+        {"role": "user", "content": str(item.get("content") or "")}
+        for item in (history or [])
+        if item.get("role") == "user" and str(item.get("content") or "").strip()
+    ]
 
 
 class ChatService:
@@ -258,15 +268,17 @@ class ChatService:
         try:
             # Try memory_service first; fall back to direct DB load if empty.
             history = self._load_history(_db, conversation_id, query)
-            qa_turns = [h for h in history if h.get("role") in ("user", "assistant")]
-            if not qa_turns:
-                qa_turns = self._load_recent_turns_direct(conversation_id)
-            print(f"[CONTEXTUALIZE] qa_turns={len(qa_turns)} conv={conversation_id[:8]}", flush=True)
-            if not qa_turns:
+            question_history = _question_only_history(history)
+            if not question_history:
+                question_history = _question_only_history(
+                    self._load_recent_turns_direct(conversation_id)
+                )
+            print(f"[CONTEXTUALIZE] questions={len(question_history)} conv={conversation_id[:8]}", flush=True)
+            if not question_history:
                 return query
 
             turns: list[str] = []
-            for h in qa_turns[-6:]:
+            for h in question_history[-6:]:
                 role = "Người dùng" if h["role"] == "user" else "Trợ lý"
                 turns.append(f"{role}: {(h.get('content') or '')[:300]}")
 
@@ -289,6 +301,7 @@ class ChatService:
                 system="Bạn là hệ thống xử lý ngôn ngữ. Chỉ trả về câu hỏi đã viết lại.",
                 max_tokens=200,
                 temperature=0.0,
+                include_markdown_instructions=False,
             )
             print(f"[CONTEXTUALIZE] raw_rewritten={rewritten!r}", flush=True)
             rewritten = (rewritten or "").strip().strip('"').strip()
@@ -315,402 +328,6 @@ class ChatService:
                 excerpt=s.get("excerpt"),
             )
             self.msg_sources.create(db, src)
-
-    # ------------------------------------------------------------------
-    # Policy helpers
-    # ------------------------------------------------------------------
-
-    # Rewrite chunk text at a higher abstraction level, removing specific sensitive values.
-    def _generalize_chunk(self, chunk: dict) -> dict:
-        original = chunk.get("document_text", "")
-        if not original:
-            return chunk
-
-        contract            = chunk.get("_policy_contract", {})
-        numeric_granularity = (contract.get("numeric_granularity") or "aggregated").lower()
-        _numeric_desc = {
-            "hidden":     "ẩn hoàn toàn tất cả số liệu (lương, ngân sách, KPI, mã số, ...)",
-            "aggregated": "chỉ dùng số liệu tổng hợp/ước lượng (ví dụ: 'khoảng vài triệu')",
-            "range_only": "chỉ dùng dạng khoảng (ví dụ: '10–20 triệu')",
-            "exact":      "giữ nguyên số liệu chính xác",
-        }
-        numeric_hint = _numeric_desc.get(numeric_granularity, "chỉ dùng số liệu tổng hợp/ước lượng")
-
-        prompt = (
-            "Bạn là agent viết lại nội dung theo chính sách phân quyền dữ liệu.\n\n"
-            "## QUY TẮC KHÁI QUÁT HÓA\n"
-            "- Thay thế thông tin định danh cụ thể (tên người, mã số, địa chỉ, liên lạc) "
-            "bằng mô tả cấp cao hơn (ví dụ: 'một nhân viên', 'phòng ban liên quan').\n"
-            f"- Số liệu: {numeric_hint}.\n"
-            "Chỉ trả về đoạn văn đã viết lại, không giải thích.\n\n"
-            f"Đoạn văn gốc:\n{original[:1500]}"
-        )
-        try:
-            text, _, _ = llm_service.generate(prompt=prompt, max_tokens=1024, temperature=0.0)
-            if text and text.strip():
-                result = dict(chunk)
-                result["document_text"] = text.strip()
-                return result
-        except Exception as exc:
-            logger.warning("Generalize chunk failed chunk=%s: %s", chunk.get("chunk_id"), exc)
-        # LLM error — return policy notice as fallback.
-        result = dict(chunk)
-        result["document_text"] = "[Nội dung đã được khái quát hóa theo chính sách phân quyền.]"
-        return result
-
-    # Remove sensitive values in-place, keeping the surrounding structure intact.
-    def _redact_chunk(self, chunk: dict) -> dict:
-        original = chunk.get("document_text", "")
-        if not original:
-            return chunk
-        contract = chunk.get("_policy_contract", {})
-        numeric_granularity = (contract.get("numeric_granularity") or "hidden").lower()
-        _NUMERIC_DESC = {
-            "hidden":     "ẩn hoàn toàn tất cả số liệu",
-            "aggregated": "chỉ dùng số liệu tổng hợp/ước lượng",
-            "range_only": "chỉ dùng dạng khoảng",
-            "exact":      "giữ nguyên số liệu chính xác",
-        }
-        numeric_hint = _NUMERIC_DESC.get(numeric_granularity, "ẩn hoàn toàn tất cả số liệu")
-        prompt = (
-            "Bạn là agent che thông tin nhạy cảm theo chính sách phân quyền dữ liệu.\n"
-            "Thay thế TẤT CẢ thông tin nhạy cảm (tên người, mã số, địa chỉ, thông tin liên lạc, "
-            "dữ liệu nội bộ) bằng '[ẨN]'. Giữ nguyên cấu trúc và ngữ cảnh của đoạn văn.\n"
-            f"Số liệu: {numeric_hint}.\n"
-            "Chỉ trả về đoạn văn đã xử lý, không giải thích.\n\n"
-            f"Đoạn văn gốc:\n{original[:1500]}"
-        )
-        try:
-            text, _, _ = llm_service.generate(prompt=prompt, max_tokens=1024, temperature=0.0)
-            if text and text.strip():
-                result = dict(chunk)
-                result["document_text"] = text.strip()
-                return result
-        except Exception as exc:
-            logger.warning("Redact chunk failed chunk=%s: %s", chunk.get("chunk_id"), exc)
-        result = dict(chunk)
-        result["document_text"] = _POLICY_NOTICE
-        return result
-
-    # Replace personal identifiers with consistent aliases (Employee A, Department X, …).
-    def _anonymize_chunk(self, chunk: dict) -> dict:
-        original = chunk.get("document_text", "")
-        if not original:
-            return chunk
-        contract = chunk.get("_policy_contract", {})
-        numeric_granularity = (contract.get("numeric_granularity") or "aggregated").lower()
-        _NUMERIC_DESC = {
-            "hidden":     "ẩn hoàn toàn tất cả số liệu",
-            "aggregated": "chỉ dùng số liệu tổng hợp/ước lượng",
-            "range_only": "chỉ dùng dạng khoảng",
-            "exact":      "giữ nguyên số liệu chính xác",
-        }
-        numeric_hint = _NUMERIC_DESC.get(numeric_granularity, "chỉ dùng số liệu tổng hợp/ước lượng")
-        prompt = (
-            "Bạn là agent ẩn danh hóa dữ liệu.\n"
-            "Thay thế TẤT CẢ định danh cá nhân và mã số cụ thể bằng alias nhất quán "
-            "(VD: tên người → 'Nhân viên A', mã số → 'ID-001', ...).\n"
-            f"Số liệu: {numeric_hint}.\n"
-            "Chỉ trả về đoạn văn đã viết lại, không giải thích.\n\n"
-            f"Đoạn văn gốc:\n{original[:1500]}"
-        )
-        try:
-            text, _, _ = llm_service.generate(prompt=prompt, max_tokens=1024, temperature=0.0)
-            if text and text.strip():
-                result = dict(chunk)
-                result["document_text"] = text.strip()
-                return result
-        except Exception as exc:
-            logger.warning("Anonymize chunk failed chunk=%s: %s", chunk.get("chunk_id"), exc)
-        result = dict(chunk)
-        result["document_text"] = "[Nội dung đã được ẩn danh hóa theo chính sách phân quyền.]"
-        return result
-
-    # Summarize chunk into 1-2 sentences without revealing specific values.
-    def _summarize_chunk(self, chunk: dict) -> dict:
-        original = chunk.get("document_text", "")
-        if not original:
-            return chunk
-        prompt = (
-            "Bạn là agent tóm tắt nội dung theo chính sách phân quyền dữ liệu.\n"
-            "Hãy tóm tắt đoạn văn sau thành 1-2 câu ngắn gọn, "
-            "chỉ nêu chủ đề và loại thông tin có trong đoạn. "
-            "TUYỆT ĐỐI không tiết lộ giá trị cụ thể (tên người, số liệu, mã số, địa chỉ, ...).\n"
-            "Ví dụ đầu ra: 'Thông tin nhân viên bao gồm thông tin cá nhân và liên hệ.'\n"
-            "Chỉ trả về câu tóm tắt, không giải thích.\n\n"
-            f"Đoạn văn:\n{original[:1500]}"
-        )
-        try:
-            text, _, _ = llm_service.generate(prompt=prompt, max_tokens=256, temperature=0.0)
-            if text and text.strip():
-                result = dict(chunk)
-                result["document_text"] = text.strip()
-                return result
-        except Exception as exc:
-            logger.warning("Summarize chunk failed chunk=%s: %s", chunk.get("chunk_id"), exc)
-        result = dict(chunk)
-        result["document_text"] = "[Nội dung đã được tóm tắt theo chính sách phân quyền.]"
-        return result
-
-    # Dispatch each chunk to the appropriate transform based on policy decision flags.
-    def _apply_transforms(self, chunks: list[dict]) -> list[dict]:
-        result = []
-        for c in chunks:
-            if c.get("_needs_field_policy"):
-                result.append(self._apply_field_scoped_policy(c))
-            elif c.get("_needs_redact"):
-                result.append(self._redact_chunk(c))
-            elif c.get("_needs_anonymize"):
-                result.append(self._anonymize_chunk(c))
-            elif c.get("_needs_generalize"):
-                result.append(self._generalize_chunk(c))
-            elif c.get("_needs_summarize"):
-                result.append(self._summarize_chunk(c))
-            elif c.get("_needs_watermark"):
-                wc = dict(c)
-                wc["document_text"] = (c.get("document_text") or "") + "\n\n[Watermark: nội dung được kiểm soát theo chính sách phân quyền]"
-                result.append(wc)
-            else:
-                result.append(c)
-        return result
-
-    def _apply_field_scoped_policy(self, chunk: dict) -> dict:
-        """Mask only entity spans covered by field-scoped policy rules.
-
-        This is intentionally deterministic.  A second LLM rewrite could
-        accidentally reconstruct a blocked salary while rewriting an allowed
-        personal field, so salary/PII replacements happen before answer
-        generation and never leave the protected value in the RAG context.
-        """
-        text = chunk.get("document_text") or ""
-        contract = chunk.get("_policy_contract") or {}
-        entities = chunk.get("_policy_entities") or []
-        field_rules = contract.get("field_rules") or []
-
-        def clear_internal_fields(value: dict) -> dict:
-            cleaned = dict(value)
-            cleaned.pop("_policy_entities", None)
-            cleaned.pop("_needs_field_policy", None)
-            return cleaned
-
-        if not text or not field_rules or not entities:
-            return clear_internal_fields(chunk)
-
-        builtin_flags = {
-            "email": {"has_pii"}, "phone": {"has_pii"},
-            "national_id": {"has_pii", "has_hr"}, "tax_id": {"has_pii", "has_hr"},
-            "social_insurance": {"has_pii", "has_hr"}, "bank_account": {"has_pii", "has_financial"},
-            "dob": {"has_pii", "has_hr"}, "money": {"has_financial"},
-            "percentage": {"has_financial"},
-        }
-        detail_order = {"redact": 4, "anonymize": 3, "generalize": 2, "summarize": 1}
-        replacements: list[tuple[int, int, str]] = []
-
-        for entity in sorted(entities, key=lambda item: (int(item.get("start", 0)), -int(item.get("end", 0)))):
-            try:
-                start, end = int(entity.get("start", 0)), int(entity.get("end", 0))
-            except (TypeError, ValueError):
-                continue
-            if start < 0 or end <= start or end > len(text):
-                continue
-            label = str(entity.get("label") or "").lower()
-            flags = set(entity.get("flags") or builtin_flags.get(label, set()))
-            matches = []
-            for rule in field_rules:
-                targets = {str(v).lower() for v in (rule.get("target_entity_types") or [])}
-                target_flags = {str(v).lower() for v in (rule.get("target_flags") or [])}
-                if (targets and label in targets) or (target_flags and flags.intersection(target_flags)):
-                    matches.append(rule)
-            if not matches:
-                continue
-
-            normalized_actions = {
-                str(rule.get("action") or (rule.get("contract") or {}).get("violation_action") or "allow").lower()
-                for rule in matches
-            }
-
-            # A targeted ALLOW is a no-op for this entity. It must not inherit
-            # the default max_detail=generalize and accidentally redact it.
-            if normalized_actions <= {"allow"}:
-                continue
-
-            if "block" in normalized_actions or "deny" in normalized_actions:
-                replacement = "[ĐÃ ẨN THEO CHÍNH SÁCH]"
-            else:
-                conditional_matches = [
-                    rule for rule in matches
-                    if str(rule.get("action") or (rule.get("contract") or {}).get("violation_action") or "allow").lower()
-                    in {"conditional", "redact", "anonymize", "generalize", "summarize"}
-                ]
-                # Watermark and ALLOW do not rewrite a field. If no
-                # conditional rule remains, preserve the entity as-is.
-                if not conditional_matches:
-                    continue
-                rule = max(
-                    conditional_matches,
-                    key=lambda item: (
-                        detail_order.get(str((item.get("contract") or {}).get("max_detail", "generalize")).lower(), 2),
-                        int(item.get("priority") or 0),
-                    ),
-                )
-                detail = str((rule.get("contract") or {}).get("max_detail", "generalize")).lower()
-                if detail == "redact":
-                    replacement = "[ĐÃ ẨN]"
-                elif detail == "anonymize":
-                    replacement = "[ĐỐI TƯỢNG ĐÃ ẨN DANH]"
-                elif detail == "summarize":
-                    replacement = "[THÔNG TIN ĐÃ TÓM TẮT]"
-                elif label in {"money", "percentage", "bank_account"} or "financial" in label:
-                    replacement = "[GIÁ TRỊ TÀI CHÍNH ĐÃ KHÁI QUÁT]"
-                else:
-                    replacement = "[THÔNG TIN CÁ NHÂN ĐÃ KHÁI QUÁT]"
-            # Keep field redaction user-facing and never expose internal
-            # bracketed entity labels in the answer context.
-            replacement = "giá trị đã được ẩn theo chính sách"
-            replacements.append((start, end, replacement))
-
-        if not replacements:
-            return clear_internal_fields(chunk)
-        # Apply right-to-left and avoid overlapping replacements.
-        output = text
-        occupied_end = len(text) + 1
-        for start, end, replacement in sorted(replacements, key=lambda item: item[0], reverse=True):
-            if end > occupied_end:
-                continue
-            output = output[:start] + replacement + output[end:]
-            occupied_end = start
-        result = dict(chunk)
-        result["document_text"] = output
-        return clear_internal_fields(result)
-
-    # Run the policy-contract agent per chunk; return (approved_chunks, contracts).
-    # Corp members (admin) bypass all policy constraints.
-    def _apply_policy_contracts(
-        self,
-        db: Session,
-        chunks: list[dict],
-        user,
-        raw_query: str,
-        intent_class: str,
-    ) -> tuple[list[dict], list[dict]]:
-        approved: list[dict] = []
-        contracts: list[dict] = []
-
-        declared_sensitivity = 2
-
-        # ── Corp member bypass ────────────────────────────────────────────
-        # Corp members (users with a position in the root OrgUnit) bypass all policy.
-        try:
-            from sqlalchemy import text as _sql
-            _corp_check = db.execute(_sql("""
-                SELECT 1
-                FROM user_oui_positions uop
-                JOIN org_unit_instances oui ON uop.oui_id = oui.id
-                JOIN org_units ou ON oui.ou_id = ou.id
-                WHERE uop.user_id = :uid AND ou.parent_id IS NULL
-                LIMIT 1
-            """), {"uid": user.id}).fetchone()
-            if _corp_check:
-                print(f"[POLICY] corp member uid={user.id[:8]} → bypass policy, {len(chunks)} chunks approved")
-                return list(chunks), []
-        except Exception as exc:
-            logger.warning("Corp member check failed: %s", exc)
-
-        user_positions: list[dict] = []
-        for up in (getattr(user, "oui_positions", None) or []):
-            pos = getattr(up, "position", None)
-            if pos and up.oui_id:
-                user_positions.append({
-                    "oui_id":    up.oui_id,
-                    "clearance": pos.clearance,
-                })
-
-        # ── Batch GLiNER for all chunks at once ───────────────────────────
-        chunk_texts = [c.get("document_text") or "" for c in chunks]
-        try:
-            from app.services.entity_extractor import extract_realtime_batch_detailed
-            batch_details = extract_realtime_batch_detailed(chunk_texts, db=db)
-        except Exception as exc:
-            logger.warning("Batch entity extraction failed: %s", exc)
-            batch_details = [{"entities": [], "entity_types": set(), "flags": set()} for _ in chunks]
-
-        # Shared across chunks — LLM relevance filter fires at most once per unique rule set.
-        rule_filter_cache: dict = {}
-
-        for i, chunk in enumerate(chunks):
-            md = chunk.get("metadata") or {}
-            chunk_id = chunk.get("chunk_id") or "unknown"
-            chunk_text = chunk.get("document_text") or ""
-            chunk_sensitivity = int(md.get("sensitivity") or declared_sensitivity)
-
-            try:
-                contract = policy_contract_agent.generate_contract(
-                    chunk_id=chunk_id,
-                    chunk_text=chunk_text,
-                    chunk_metadata=md,
-                    declared_sensitivity=chunk_sensitivity,
-                    user_role=getattr(user, "role", "Employee"),
-                    user_level=getattr(user, "clearance_level", 1),
-                    user_department=getattr(user, "department", ""),
-                    user_id=user.id,
-                    intent_class=intent_class,
-                    raw_query=raw_query,
-                    user_positions=user_positions,
-                    detected_entity_types=batch_details[i].get("entity_types", set()),
-                    detected_flags=batch_details[i].get("flags", set()),
-                    detected_entities=batch_details[i].get("entities", []),
-                    rule_filter_cache=rule_filter_cache,
-                    db=db,
-                )
-                contracts.append(contract)
-
-                decision   = str(contract.get("decision", "allow")).lower()
-                max_detail = contract.get("max_detail", "generalize")
-                _ctr = {
-                    "max_detail":          max_detail,
-                    "numeric_granularity": contract.get("numeric_granularity", "aggregated"),
-                }
-                print(f"[POLICY] apply chunk={chunk_id[:8]} decision={decision} max_detail={max_detail}")
-                if decision == "block":
-                    print(f"[POLICY]   → BLOCK: chunk bị loại bỏ")
-                    logger.info("Policy block chunk=%s", chunk_id)
-                    continue
-                elif decision == "conditional":
-                    chunk = dict(chunk)
-                    chunk["_policy_contract"] = _ctr
-                    if max_detail == "redact":
-                        chunk["_needs_redact"] = True
-                    elif max_detail == "anonymize":
-                        chunk["_needs_anonymize"] = True
-                    elif max_detail == "summarize":
-                        chunk["_needs_summarize"] = True
-                    else:  # generalize (default)
-                        chunk["_needs_generalize"] = True
-                    print(f"[POLICY]   → CONDITIONAL: transform={max_detail} numeric={_ctr['numeric_granularity']}")
-                    logger.info("Policy conditional chunk=%s max_detail=%s", chunk_id, max_detail)
-                elif decision == "field_scoped":
-                    chunk = dict(chunk)
-                    policy_contract = contract.get("contract") or {}
-                    chunk["_policy_contract"] = policy_contract
-                    chunk["_policy_entities"] = batch_details[i].get("entities", [])
-                    chunk["_needs_field_policy"] = True
-                    logger.info("Policy field-scoped chunk=%s rules=%s", chunk_id, len(policy_contract.get("field_rules") or []))
-                elif decision == "watermark":
-                    chunk = dict(chunk)
-                    chunk["_needs_watermark"] = True
-                    print(f"[POLICY]   → WATERMARK")
-                    logger.info("Policy watermark chunk=%s", chunk_id)
-                else:
-                    print(f"[POLICY]   → ALLOW: chunk đi qua không đổi")
-                # allow → pass through as-is
-
-                approved.append(chunk)
-            except Exception as exc:
-                logger.warning("Policy contract failed chunk=%s: %s", chunk_id, exc)
-                approved.append(chunk)
-
-        return approved, contracts
-
     # Trigger a conversation summary update in a background thread.
     def _update_summary_background(self, conversation_id: str) -> None:
         try:
@@ -740,6 +357,9 @@ class ChatService:
             "relevance":     r.get("score") if r.get("score") is not None else r.get("relevance"),
             "excerpt":       r.get("document_text") or md.get("excerpt"),
             "docRestricted": r.get("doc_restricted", False),
+            "entityAccessRequired": r.get("entity_access_required", False),
+            "entityAccessGranted": r.get("entity_access_granted", False),
+            "blockedEntityTypes": r.get("blocked_entity_types") or (md.get("blocked_entity_types") or []),
         }
 
     # Renumber [N] citation markers to be sequential (1-based) and return matched sources.
@@ -881,61 +501,56 @@ class ChatService:
         # hard data boundary before sending it to the model.
         retrieved = prompt_injection_guard.annotate_chunks(retrieved)
 
-        # ── [POLICY] Policy-contract enforcement ──────────────────────
+        # Entity actions are evaluated after retrieval and before prompt construction.
         policy_contracts: list[dict] = []
         has_watermark = False
-        if POLICY_ENABLED and retrieved:
-            query_intent = intent_classifier.classify(effective_query)
-            retrieved, policy_contracts = self._apply_policy_contracts(
-                db, retrieved, user, effective_query, query_intent
+        if (
+            POLICY_ENABLED
+            and retrieved
+            and not entity_policy_service.bypasses_entity_actions(user)
+        ):
+            retrieved, policy_contracts = entity_policy_service.apply_to_retrieved(
+                db, user, effective_query, retrieved
             )
-            has_watermark = any(str(c.get("decision", "")).lower() in {"watermark", "allow_with_watermark"} for c in policy_contracts)
-            print(f"[POLICY] intent={query_intent} approved={len(retrieved)}/{len(retrieved_raw)} watermark={has_watermark}")
-            for _c in policy_contracts:
-                rules = [r.get("rule_code") for r in _c.get("applied_rules", [])]
-                domains = [d.get("code") for d in _c.get("domains", [])]
-                print(f"[POLICY] chunk={_c.get('chunk_id','?')[:8]} domains={domains} decision={_c.get('decision')} rules={rules}")
-            retrieved = self._apply_transforms(retrieved)
+            print(
+                f"[ENTITY-POLICY] processed={len(retrieved)}/{len(retrieved_raw)} "
+                f"blocked={sum(1 for c in policy_contracts if c.get('decision') == 'block')}"
+            )
 
-        # Collect unique applied rules (non-allow only) for SSE streaming to client.
+        # Keep the legacy wire field name while exposing entity actions, not rules.
         seen_rule_codes: set[str] = set()
         applied_rules: list[dict] = []
         for contract in policy_contracts:
-            final_decision = str(contract.get("decision", "allow")).lower()
-            if final_decision == "allow":
-                continue
-            for rule in contract.get("applied_rules", []):
-                # Only surface rules whose own action determined the final outcome.
-                # e.g. block+conditional → only block rules shown; conditional+conditional → all shown.
-                if final_decision != "field_scoped" and str(rule.get("action", "")).lower() != final_decision:
+            for entity in contract.get("matched_entities", []):
+                entity_type = str(entity.get("entity_type") or "")
+                code = f"entity:{entity_type}"
+                if not entity_type or code in seen_rule_codes:
                     continue
-                code = rule.get("rule_code", "")
-                if code and code not in seen_rule_codes:
-                    seen_rule_codes.add(code)
-                    applied_rules.append({
-                        "rule_code": code,
-                        "name":      rule.get("name", code),
-                        "action":    rule.get("action", final_decision) if final_decision == "field_scoped" else final_decision,
-                        "domain":    rule.get("domain", ""),
-                    })
+                seen_rule_codes.add(code)
+                applied_rules.append({
+                    "rule_code": code,
+                    "name": entity_type,
+                    "action": entity.get("action", "full"),
+                    "domain": "document",
+                    "entity_type": entity_type,
+                })
 
         policy_summary = [
             {
                 "decision": contract.get("decision", "allow"),
-                "max_detail": contract.get("max_detail"),
-                "numeric_granularity": contract.get("numeric_granularity"),
-                "field_rules": (contract.get("contract") or {}).get("field_rules", []),
+                "matched_entities": contract.get("matched_entities", []),
+                "requires_access_request": contract.get("requires_access_request", False),
             }
             for contract in policy_contracts
         ]
 
         has_restricted = bool(retrieved and any(
-            c.get("document_text") == _POLICY_NOTICE for c in retrieved
+            c.get("entity_access_required") is True for c in retrieved
         )) or bool(
-            policy_contracts and any(str(c.get("decision", "")).lower() in ("block", "deny", "redact") for c in policy_contracts)
+            policy_contracts and any(c.get("requires_access_request") for c in policy_contracts)
         )
         all_restricted = bool(retrieved and all(
-            c.get("document_text") == _POLICY_NOTICE for c in retrieved
+            c.get("entity_access_required") for c in retrieved
         ))
 
         history = self._load_history(db, conversation_id, effective_query)
@@ -981,7 +596,11 @@ class ChatService:
         source_list = list(sources or [])
         cited = cls._extract_cited_indices(answer)
         if not cited:
-            return answer, []
+            # Keep locked entity citations visible for the request-access action.
+            return answer, [
+                source for source in source_list
+                if source.get("entityAccessRequired") or source.get("docRestricted")
+            ]
 
         keep: list[dict] = []
         old_to_new: dict[int, int] = {}
@@ -990,7 +609,7 @@ class ChatService:
                 continue
             if allowed_indices is not None and old_idx not in allowed_indices:
                 continue
-            if source.get("docRestricted"):
+            if source.get("docRestricted") and not source.get("entityAccessRequired"):
                 continue
             source_text = " ".join(
                 str(source.get(key) or "")
@@ -1237,7 +856,7 @@ class ChatService:
         # All chunks were REDACT'd — respond directly without calling the LLM.
         if all_restricted:
             answer_text = "Thông tin này bị hạn chế theo chính sách phân quyền của hệ thống và không thể hiển thị."
-            sources = []
+            sources = [self._make_source_entry(chunk) for chunk in retrieved]
             assistant_status = "success"
 
         elif llm_service.is_configured():
@@ -1618,7 +1237,6 @@ class ChatService:
         ).start()
 
         yield {"type": "done", "content": full_text, "sources": sources, "messageId": assistant_msg.id, "applied_rules": stream_applied_rules}
-
 
 # Module-level singleton; imported by the chat API router.
 chat_service = ChatService()

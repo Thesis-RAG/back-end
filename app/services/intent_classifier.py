@@ -89,6 +89,7 @@ class IntentClassifier:
                 system=_CLASSIFY_SYSTEM,
                 max_tokens=32,
                 temperature=0.0,
+                include_markdown_instructions=False,
             )
             import json
             m = re.search(r'\{[\s\S]*\}', text)

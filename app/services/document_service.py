@@ -17,6 +17,7 @@ from app.models.chunk_embedding import ChunkEmbedding
 from app.models.document import Document
 from app.models.document_chunk import DocumentChunk
 from app.models.document_version import DocumentVersion
+from app.models.document_entity_action import DocumentEntityAction
 from app.models.job import Job
 from app.models.job_step import JobStep
 from app.models.org_unit_instance import OrgUnitInstance
@@ -28,10 +29,13 @@ from app.repositories.version_repository import VersionRepository
 from app.schemas.document import ChunkingConfig, DocumentCreateRequest, DocumentUpdateRequest
 from app.services.audit_service import audit_service
 from app.services.chroma_service import chroma_service
+from app.services.entity_extractor import adjust_chunk_sensitivity
 from app.services.job_service import job_service
 from app.services.oui_tree_service import oui_tree_service
+from app.services.sensitivity_levels import MIN_SENSITIVITY
 from app.services.storage_service import storage_service
 from app.services.user_service import user_service as _user_service
+from app.services.entity_policy_service import normalize_actions
 
 logger = logging.getLogger(__name__)
 
@@ -80,33 +84,30 @@ class DocumentService:
 
     # ── Policy contract ───────────────────────────────────────────────────────
 
-    # Build a policy contract dict based on the document's sensitivity level.
-    def _policy_contract(self, doc: Document) -> dict:
-        if doc.sensitivity >= 4:
-            max_detail = "department"
-            numeric_granularity = "aggregated"
-        elif doc.sensitivity == 3:
-            max_detail = "project"
-            numeric_granularity = "aggregated"
-        else:
-            max_detail = "full"
-            numeric_granularity = "full"
-        return {
-            "max_detail": max_detail,
-            "numeric_granularity": numeric_granularity,
-            "policy_version": settings.default_policy_version,
-        }
+    # Persist a neutral snapshot for compatibility; runtime contracts are
+    # generated from the version's per-entity actions during retrieval.
+    def _entity_action_snapshot(self, doc: Document) -> dict:
+        return {"mode": "entity_actions", "document_id": doc.id}
 
     # ── CRUD ──────────────────────────────────────────────────────────────────
 
     # Return all documents the user may view via FGA grants and ownership.
     def list_documents(self, db: Session, user: User) -> list[Document]:
         viewable_ids = fga_adapter.list_viewable_document_ids(user.id, self._user_clearance(db, user))
+        public_filter = Document.sensitivity == MIN_SENSITIVITY
         if not viewable_ids:
-            # Owner can always view their own document.
-            return db.query(Document).filter(Document.owner_user_id == user.id).all()
+            # Public documents are visible to every authenticated user, even
+            # when they have no OUI grant. Owners can always view their own
+            # documents as well.
+            return db.query(Document).filter(
+                or_(
+                    public_filter,
+                    Document.owner_user_id == user.id,
+                )
+            ).all()
         return db.query(Document).filter(
             or_(
+                public_filter,
                 Document.id.in_(viewable_ids),
                 Document.owner_user_id == user.id,
             )
@@ -117,6 +118,8 @@ class DocumentService:
         doc = self.docs.get_by_id(db, doc_id)
         if not doc:
             raise HTTPException(status_code=404, detail="Document not found")
+        if doc.sensitivity == MIN_SENSITIVITY:
+            return doc
         ok, reason = self._can_view(db, user, doc)
         if not ok:
             raise HTTPException(status_code=403, detail=reason)
@@ -224,8 +227,9 @@ class DocumentService:
         return doc
 
     # Re-compute chunk_sensitivity for all chunks after a doc sensitivity change.
-    # Uses the LLM-assigned llm_chunk_sensitivity stored in Chroma to preserve the
-    # relative delta: new_cs = clamp(new_sensitivity + (llm_cs - old_sensitivity), 1, 5).
+    # Uses the old chunker/LLM sensitivity plus the persisted GLiNER entities.
+    # Raises stay intact; reductions require the same strict common-public-
+    # entity check used during ingest.
     def _resync_chunk_sensitivity(
         self, db: Session, doc: Document, new_sensitivity: int, old_sensitivity: int
     ) -> None:
@@ -253,27 +257,43 @@ class DocumentService:
             logger.warning("Could not fetch Chroma metadata for doc %s: %s", doc.id, exc)
             chroma_metas = {}
 
-        groups: dict[int, list[str]] = defaultdict(list)
+        groups: dict[tuple[int, int], list[str]] = defaultdict(list)
         for cid in chunk_ids:
             chroma_meta = chroma_metas.get(cid, {})
             llm_cs = chroma_meta.get("llm_chunk_sensitivity")
-            if llm_cs is not None:
-                delta = int(llm_cs) - old_sensitivity
-                new_cs = max(1, min(5, new_sensitivity + delta))
-            else:
-                # Fallback for chunks ingested before llm_chunk_sensitivity was stored.
-                new_cs = new_sensitivity
-            groups[new_cs].append(cid)
-
             chunk = chunk_by_id[cid]
             meta = dict(chunk.metadata_json or {})
+            if llm_cs is None:
+                # Fallback for chunks ingested before llm_chunk_sensitivity
+                # was stored: the old chunk metadata is the best available base.
+                llm_cs = meta.get("llm_chunk_sensitivity", old_sensitivity)
+            try:
+                # Rebase the old chunker's relative delta to the new document
+                # level before applying the GLiNER safety rule.
+                rebased_llm_cs = int(new_sensitivity) + (int(llm_cs) - int(old_sensitivity))
+            except (TypeError, ValueError):
+                rebased_llm_cs = new_sensitivity
+            rebased_llm_cs = max(1, min(5, rebased_llm_cs))
+            new_cs = adjust_chunk_sensitivity(
+                new_sensitivity,
+                rebased_llm_cs,
+                meta.get("detected_entities") or [],
+                meta.get("sensitivity_flags") or set(),
+            )
+            groups[(new_cs, rebased_llm_cs)].append(cid)
             meta["chunk_sensitivity"] = new_cs
+            meta["llm_chunk_sensitivity"] = rebased_llm_cs
             chunk.metadata_json = meta
 
-        for cs_val, cids in groups.items():
+        for (cs_val, llm_cs), cids in groups.items():
             try:
                 chroma_service.update_document_metadata(
-                    cids, {"chunk_sensitivity": cs_val, "sensitivity": new_sensitivity}
+                    cids,
+                    {
+                        "chunk_sensitivity": cs_val,
+                        "llm_chunk_sensitivity": llm_cs,
+                        "sensitivity": new_sensitivity,
+                    },
                 )
             except Exception as exc:
                 logger.warning("Failed to update Chroma chunk_sensitivity for doc %s: %s", doc.id, exc)
@@ -288,6 +308,7 @@ class DocumentService:
         self, db: Session, user: User, doc_id: str, *,
         raw_bytes: bytes, filename: str, content_type: str,
         trace_id: str, chunking_config: "ChunkingConfig | None" = None,
+        entity_actions: list[dict] | None = None,
     ) -> tuple[Document, DocumentVersion, object, bool]:
         doc = self.docs.get_by_id(db, doc_id)
         if not doc:
@@ -326,13 +347,28 @@ class DocumentService:
         )
         self.versions.create(db, version)
 
+        for sort_order, action in enumerate(normalize_actions(entity_actions or [])):
+            db.add(DocumentEntityAction(
+                document_version_id=version.id,
+                entity_type=action["entity_type"],
+                label=action.get("label"),
+                action=action["action"],
+                source=action.get("source", "manual"),
+                enabled=action.get("enabled", True),
+                detection_count=action.get("detection_count", 0),
+                sort_order=sort_order,
+                scope_oui_ids=action.get("scope_oui_ids") or [],
+                scope_position_ids=action.get("scope_position_ids") or [],
+                metadata_json=action.get("metadata_json") or {},
+            ))
+
         doc.current_version_id = version.id
         doc.status = "uploaded"
 
         snapshot = DocumentPolicySnapshot(
             document_version_id=version.id,
             policy_version=settings.default_policy_version,
-            contract_json=self._policy_contract(doc),
+            contract_json=self._entity_action_snapshot(doc),
         )
         db.add(snapshot)
 

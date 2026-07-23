@@ -3,6 +3,7 @@ Document management endpoints: create, list, update, delete, version upload,
 file streaming, review workflow (submit/approve/reject), and ingest triggering.
 """
 import io
+import json
 import urllib.parse
 
 from fastapi import APIRouter, Depends, File, Form, HTTPException, Request, UploadFile
@@ -26,6 +27,8 @@ from app.schemas.document import (
 )
 from app.schemas.job import JobRead
 from app.services.document_service import document_service
+from app.services.entity_policy_service import entity_policy_service, normalize_actions
+from app.schemas.entity_policy import EntityPreviewResponse
 from app.services.user_service import user_service as _user_service
 from app.workers.ingest_tasks import process_ingest_job
 
@@ -47,6 +50,28 @@ def _trigger_pending_job(db: Session, document_id: str) -> None:
         job.status = "queued"
         db.commit()
         process_ingest_job.delay(job.id)
+
+
+@router.post("/entity-preview", response_model=EntityPreviewResponse)
+async def preview_file_entities(
+    file: UploadFile = File(...),
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """Detect configurable entities in the full file before it is persisted."""
+    raw_bytes = await file.read()
+    if len(raw_bytes) > 50 * 1024 * 1024:
+        raise HTTPException(status_code=413, detail="File too large")
+    try:
+        result = entity_policy_service.preview(
+            raw_bytes,
+            file.filename or "upload.bin",
+            file.content_type or "application/octet-stream",
+            db,
+        )
+        return result
+    except Exception as exc:
+        raise HTTPException(status_code=422, detail=f"Cannot detect entities: {exc}") from exc
 
 
 # Create a new document record for the current user.
@@ -151,6 +176,7 @@ async def upload_version(
     chunk_max_tokens: int = Form(default=512),
     chunk_overlap_tokens: int = Form(default=80),
     chunk_ocr: bool = Form(default=False),
+    entity_actions_json: str = Form(default="[]"),
 ):
     raw_bytes = await file.read()
     if len(raw_bytes) > 50 * 1024 * 1024:
@@ -160,12 +186,17 @@ async def upload_version(
         mode="llm_structured", max_tokens=chunk_max_tokens,
         overlap_tokens=chunk_overlap_tokens, ocr=chunk_ocr,
     )
+    try:
+        entity_actions = normalize_actions(json.loads(entity_actions_json or "[]"))
+    except (TypeError, ValueError, json.JSONDecodeError) as exc:
+        raise HTTPException(status_code=422, detail="Invalid entity action configuration") from exc
 
     doc, version, job, queued = document_service.create_version(
         db, current_user, document_id,
         raw_bytes=raw_bytes, filename=file.filename or "upload.bin",
         content_type=file.content_type or "application/octet-stream",
         trace_id=request.state.trace_id, chunking_config=chunking_config,
+        entity_actions=entity_actions,
     )
 
     if _is_corp_member(db, current_user):
@@ -216,6 +247,23 @@ def view_document_file(
     ).first()
     if not version or not version.source_object:
         raise HTTPException(status_code=404, detail="File not found")
+
+    blocked_entity_types = entity_policy_service.blocked_types_for_version(
+        db, version.id, current_user
+    )
+    if blocked_entity_types and not entity_policy_service.has_entity_access(
+        db, current_user, document_id, version.id, blocked_entity_types
+    ):
+        raise HTTPException(
+            status_code=403,
+            detail={
+                "code": "entity_access_required",
+                "document_id": document_id,
+                "document_version_id": version.id,
+                "entity_types": sorted(blocked_entity_types),
+                "message": "Entity access approval is required to view this file",
+            },
+        )
 
     src_obj = version.source_object
     data = StorageRepository().get_bytes(src_obj.bucket, src_obj.object_key)

@@ -24,6 +24,6 @@ google-auth-oauthlib
 google-api-python-client
 alembic
 rank-bm25==0.2.2
-gliner
+gliner==0.2.27
 
 
