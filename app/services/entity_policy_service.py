@@ -14,6 +14,7 @@ from app.models.document_version import DocumentVersion
 from app.repositories.document_entity_repository import document_entity_repository
 from app.services.entity_extractor import extract_realtime_batch_detailed, run_pipeline
 from app.services.parser_service import parser_service
+from app.services.policy_rule_service import DEFAULT_POLICY_PROFILE, policy_rule_service
 from app.services.user_service import user_service
 
 
@@ -95,6 +96,10 @@ def _replace_entity_spans(text: str, entities: list[dict], replacements: dict[st
 
 
 class EntityPolicyService:
+    def policy_snapshot(self, db: Session) -> dict:
+        """Resolve the active global policy for a new document version."""
+        return policy_rule_service.snapshot(db, DEFAULT_POLICY_PROFILE)
+
     @staticmethod
     def max_user_clearance(user) -> int:
         """Return the highest clearance available on either user shape."""
@@ -152,6 +157,26 @@ class EntityPolicyService:
         from app.core.config import settings
         details = run_pipeline(parsed.full_text, db=db, gliner_threshold=settings.gliner_threshold)
         entities = details.get("entities") or []
+        confirmed_labels = sorted({normalize_entity_type(item.get("label")) for item in entities if item.get("label")})
+        policy = self.policy_snapshot(db)
+        rules = {
+            str(item["entity_key"]): item
+            for item in policy["resolved_rules"]
+            if item.get("entity_key") in confirmed_labels
+        }
+        applied_rules = []
+        for entity_type in confirmed_labels:
+            rule = rules.get(entity_type)
+            if rule:
+                applied_rules.append({
+                    "entity_key": entity_type,
+                    "display_name": rule.get("display_name") or entity_type,
+                    "action": rule.get("action") or "full",
+                    "detection_count": sum(1 for entity in entities if normalize_entity_type(entity.get("label")) == entity_type),
+                })
+        action_summary = {"block": 0, "mask": 0, "full": 0}
+        for rule in applied_rules:
+            action_summary[rule["action"]] = action_summary.get(rule["action"], 0) + rule["detection_count"]
         serializable = []
         for entity in entities:
             serializable.append({
@@ -168,7 +193,12 @@ class EntityPolicyService:
             "text_preview": parsed.full_text[:12000],
             "text_truncated": len(parsed.full_text) > 12000,
             "entities": serializable,
-            "entity_types": sorted({item["label"] for item in serializable if item["label"]}),
+            "entity_types": confirmed_labels,
+            "confirmed_labels": confirmed_labels,
+            "policy_profile": policy["policy_profile"],
+            "policy_version": policy["policy_version"],
+            "applied_rules": applied_rules,
+            "action_summary": action_summary,
         }
 
     def detect_full_text(self, text: str, db: Session) -> dict:
@@ -186,10 +216,11 @@ class EntityPolicyService:
         }
 
     def configured_labels(self, db: Session) -> list[str]:
-        rows = db.query(DocumentEntityAction.entity_type).filter(
-            DocumentEntityAction.enabled.is_(True)
-        ).distinct().all()
-        return sorted({normalize_entity_type(row[0]) for row in rows if row[0]})
+        return sorted({
+            normalize_entity_type(rule.entity_key)
+            for rule in policy_rule_service.active_rules(db, DEFAULT_POLICY_PROFILE)
+            if rule.entity_key
+        })
 
     def query_entities(self, query: str, db: Session) -> set[str]:
         from app.core.config import settings
@@ -259,9 +290,23 @@ class EntityPolicyService:
             return chunks, []
 
         query_entities = self.query_entities(query, db)
-        details = extract_realtime_batch_detailed(
-            [str(chunk.get("document_text") or "") for chunk in chunks], db=db
-        )
+        # Use each chunk's snapshotted label set. This prevents a later global
+        # rule edit from changing how an older document is interpreted.
+        details: list[dict] = []
+        for chunk in chunks:
+            metadata = chunk.get("metadata") or {}
+            raw_labels = metadata.get("confirmed_labels")
+            if isinstance(raw_labels, str):
+                snapshot_labels = [value for value in raw_labels.split(",") if value]
+            elif isinstance(raw_labels, (list, tuple, set)):
+                snapshot_labels = [str(value) for value in raw_labels]
+            else:
+                snapshot_labels = None
+            details.extend(extract_realtime_batch_detailed(
+                [str(chunk.get("document_text") or "")],
+                db=db,
+                labels=snapshot_labels,
+            ))
         version_ids = [
             str((chunk.get("metadata") or {}).get("document_version_id"))
             for chunk in chunks

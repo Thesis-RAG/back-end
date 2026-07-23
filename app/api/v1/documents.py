@@ -3,7 +3,6 @@ Document management endpoints: create, list, update, delete, version upload,
 file streaming, review workflow (submit/approve/reject), and ingest triggering.
 """
 import io
-import json
 import urllib.parse
 
 from fastapi import APIRouter, Depends, File, Form, HTTPException, Request, UploadFile
@@ -27,7 +26,7 @@ from app.schemas.document import (
 )
 from app.schemas.job import JobRead
 from app.services.document_service import document_service
-from app.services.entity_policy_service import entity_policy_service, normalize_actions
+from app.services.entity_policy_service import entity_policy_service
 from app.schemas.entity_policy import EntityPreviewResponse
 from app.services.user_service import user_service as _user_service
 from app.workers.ingest_tasks import process_ingest_job
@@ -176,7 +175,8 @@ async def upload_version(
     chunk_max_tokens: int = Form(default=512),
     chunk_overlap_tokens: int = Form(default=80),
     chunk_ocr: bool = Form(default=False),
-    entity_actions_json: str = Form(default="[]"),
+    # Kept out of the public workflow: actions come from the active global
+    # policy and are snapshotted automatically for this version.
 ):
     raw_bytes = await file.read()
     if len(raw_bytes) > 50 * 1024 * 1024:
@@ -186,17 +186,11 @@ async def upload_version(
         mode="llm_structured", max_tokens=chunk_max_tokens,
         overlap_tokens=chunk_overlap_tokens, ocr=chunk_ocr,
     )
-    try:
-        entity_actions = normalize_actions(json.loads(entity_actions_json or "[]"))
-    except (TypeError, ValueError, json.JSONDecodeError) as exc:
-        raise HTTPException(status_code=422, detail="Invalid entity action configuration") from exc
-
     doc, version, job, queued = document_service.create_version(
         db, current_user, document_id,
         raw_bytes=raw_bytes, filename=file.filename or "upload.bin",
         content_type=file.content_type or "application/octet-stream",
         trace_id=request.state.trace_id, chunking_config=chunking_config,
-        entity_actions=entity_actions,
     )
 
     if _is_corp_member(db, current_user):
