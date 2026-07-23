@@ -15,6 +15,7 @@ from app.models.chunk_embedding import ChunkEmbedding
 from app.models.document import Document
 from app.models.document_chunk import DocumentChunk
 from app.models.document_version import DocumentVersion
+from app.models.document_entity_action import DocumentEntityAction
 from app.schemas.document import ChunkingConfig
 from app.services.audit_service import audit_service
 from app.services.chunker_service import ChunkConfig, chunker_service
@@ -23,6 +24,7 @@ from app.services.embedding_service import embedding_service
 from app.services.job_service import job_service
 from app.services.parser_service import parser_service
 from app.services.storage_service import storage_service
+from app.services.entity_policy_service import entity_policy_service
 
 logger = logging.getLogger(__name__)
 
@@ -130,6 +132,40 @@ class IngestPipelineService:
             version.normalized_object_id = normalized_obj.id
             db.commit()
 
+            # Detect the complete document once and retain the snapshot for
+            # the upload editor and the direct-file entity access gate.
+            full_detection = entity_policy_service.detect_full_text(parsed.full_text, db)
+            version.entity_detection_json = {
+                "entity_types": full_detection["entity_types"],
+                "entities": full_detection["entities"],
+            }
+            configured_actions = db.query(DocumentEntityAction).filter(
+                DocumentEntityAction.document_version_id == version.id,
+                DocumentEntityAction.enabled.is_(True),
+            ).all()
+            configured_by_type = {row.entity_type: row for row in configured_actions}
+            if not configured_actions:
+                # API clients that do not yet send an editor payload remain
+                # compatible and default detected entities to full visibility.
+                for sort_order, entity_type in enumerate(full_detection["entity_types"]):
+                    row = DocumentEntityAction(
+                        document_version_id=version.id,
+                        entity_type=entity_type,
+                        label=entity_type,
+                        action="full",
+                        source="gliner",
+                        enabled=True,
+                        sort_order=sort_order,
+                    )
+                    db.add(row)
+                    configured_by_type[entity_type] = row
+            for entity_type, row in configured_by_type.items():
+                row.detection_count = sum(
+                    1 for entity in full_detection["entities"]
+                    if entity.get("label") == entity_type
+                )
+            db.commit()
+
             # ── chunk ─────────────────────────────────────────────────
             chunk_step = job_service.add_step(
                 db, job_id=job.id, step_name="chunk",
@@ -139,6 +175,36 @@ class IngestPipelineService:
 
             # Pass the per-version chunking config to the chunker.
             chunks = chunker_service.chunk(parsed, config=chunking_cfg, doc_sensitivity=doc.sensitivity)
+
+            from app.services.entity_extractor import (
+                adjust_chunk_sensitivity,
+                extract_realtime_batch_detailed,
+            )
+            chunk_details = extract_realtime_batch_detailed(
+                [c.get("chunk_text") or "" for c in chunks], db=db
+            )
+            for chunk_dict, detail in zip(chunks, chunk_details):
+                metadata_json = chunk_dict.setdefault("metadata_json", {})
+                original_chunk_sensitivity = metadata_json.get(
+                    "chunk_sensitivity", doc.sensitivity
+                )
+                adjusted_chunk_sensitivity = adjust_chunk_sensitivity(
+                    doc.sensitivity,
+                    original_chunk_sensitivity,
+                    detail.get("entities") or [],
+                    detail.get("flags") or set(),
+                )
+                metadata_json["entity_types"] = sorted({
+                    str(value) for value in (detail.get("entity_types") or [])
+                })
+                metadata_json["detected_entities"] = detail.get("entities") or []
+                metadata_json["sensitivity_flags"] = sorted(detail.get("flags") or [])
+                # Preserve the old chunker/LLM result separately so changing
+                # the document level later can reproduce this decision.
+                metadata_json["llm_chunk_sensitivity"] = max(
+                    1, min(5, int(original_chunk_sensitivity))
+                )
+                metadata_json["chunk_sensitivity"] = adjusted_chunk_sensitivity
 
             chunk_models: list[DocumentChunk] = []
             for c in chunks:
@@ -198,7 +264,8 @@ class IngestPipelineService:
                     "position_ratio":      meta_json.get("position_ratio", 0.0),
                     "chunker_mode":        meta_json.get("chunker_mode", "legacy"),
                     "chunk_sensitivity":     meta_json.get("chunk_sensitivity", doc.sensitivity),
-                    "llm_chunk_sensitivity": meta_json.get("chunk_sensitivity", doc.sensitivity),
+                    "llm_chunk_sensitivity": meta_json.get("llm_chunk_sensitivity", doc.sensitivity),
+                    "entity_types": ",".join(meta_json.get("entity_types") or []),
                 }
                 chroma_service.upsert_chunk(
                     chunk_id=chunk_model.id,

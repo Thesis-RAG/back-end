@@ -12,6 +12,7 @@ from typing import Any
 import re
 
 from app.services.sensitivity_levels import SENSITIVITY_PATTERNS, MIN_SENSITIVITY, MAX_SENSITIVITY
+from app.models.document import Document
 from app.fga.adapter import fga_adapter
 from app.repositories.chroma_repository import ChromaRepository
 from app.services.embedding_service import embedding_service
@@ -503,6 +504,15 @@ class RetrievalService:
         fga_allowed_ids: set[str] = set(
             fga_adapter.list_viewable_document_ids(str(user.id), user_clearance)
         )
+
+        # Public documents are visible to every authenticated user, including
+        # documents without an OUI grant. Include them in the same allowed set
+        # so retrieval does not label their chunks as permission-denied.
+        if db is not None:
+            public_rows = db.query(Document.id).filter(
+                Document.sensitivity == MIN_SENSITIVITY
+            ).all()
+            fga_allowed_ids.update(str(row[0]) for row in public_rows)
 
         # ── Approved access requests (per-doc, not expired) ─────────────
         approved_doc_ids: set[str] = set()

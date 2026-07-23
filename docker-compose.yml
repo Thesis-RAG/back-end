@@ -1,9 +1,6 @@
-version: "3.9"
-
 services:
   mysql:
     image: mysql:8.0
-    container_name: rag-mysql
     command: --default-authentication-plugin=mysql_native_password
     environment:
       MYSQL_ROOT_PASSWORD: root
@@ -18,14 +15,12 @@ services:
 
   redis:
     image: redis:7-alpine
-    container_name: rag-redis
     ports:
       - "6379:6379"
     restart: unless-stopped
 
   postgres-fga:
     image: postgres:15-alpine
-    container_name: rag-postgres-fga
     environment:
       POSTGRES_USER: fga
       POSTGRES_PASSWORD: fga
@@ -38,7 +33,6 @@ services:
 
   openfga:
     image: openfga/openfga:latest
-    container_name: rag-openfga
     command: run --playground-enabled --authn-method=none
     ports:
       - "8080:8080"
@@ -56,7 +50,6 @@ services:
 
   openfga-migrate:
     image: openfga/openfga:latest
-    container_name: rag-openfga-migrate
     command: migrate
     environment:
       OPENFGA_DATASTORE_ENGINE: postgres
@@ -67,7 +60,6 @@ services:
 
   minio:
     image: minio/minio:latest
-    container_name: rag-minio
     command: server /data --console-address ":9001"
     environment:
       MINIO_ROOT_USER: minioadmin
@@ -81,7 +73,6 @@ services:
 
   chroma:
     image: chromadb/chroma:0.5.17
-    container_name: rag-chroma
     ports:
       - "8100:8000"
     volumes:
@@ -93,16 +84,14 @@ services:
 
   chroma-ui:
     image: fengzhichao/chromadb-admin:latest
-    container_name: rag-chroma-ui
     ports:
       - "3001:3001"
     restart: unless-stopped
 
   api:
     build: .
-    container_name: rag-api
     env_file:
-      - .env
+      - ${BACKEND_ENV_FILE:-.env.local}
     environment:
       PYTHONPATH: /app
     depends_on:
@@ -120,9 +109,8 @@ services:
 
   worker:
     build: .
-    container_name: rag-worker
     env_file:
-      - .env
+      - ${BACKEND_ENV_FILE:-.env.local}
     environment:
       PYTHONPATH: /app
     depends_on:

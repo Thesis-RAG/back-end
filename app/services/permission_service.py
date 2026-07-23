@@ -4,6 +4,7 @@ Role- and FGA-based permission checks for document view, create, and update oper
 from app.models.document import Document
 from app.models.user import User
 from app.fga.adapter import fga_adapter
+from app.services.sensitivity_levels import MIN_SENSITIVITY
 
 
 class PermissionService:
@@ -22,6 +23,8 @@ class PermissionService:
 
     # Return True if FGA grants the user view access to the document.
     def can_view_document(self, user: User, doc: Document) -> tuple[bool, str]:
+        if doc.sensitivity == MIN_SENSITIVITY:
+            return True, "ok"
         if not fga_adapter.can_view(user.id, doc.id):
             return False, "fga_denied"
         return True, "ok"

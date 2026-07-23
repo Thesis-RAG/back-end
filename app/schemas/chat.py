@@ -48,6 +48,9 @@ class SourceRead(BaseModel):
     excerpt: Optional[str]
     surroundingContext: Optional[str] = None
     docRestricted: Optional[bool] = False
+    entityAccessRequired: Optional[bool] = False
+    entityAccessGranted: Optional[bool] = False
+    blockedEntityTypes: list[str] = []
 
 
 class MessagePostResponse(BaseModel):

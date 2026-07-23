@@ -146,6 +146,7 @@ class MemoryService:
                 prompt=prompt,
                 max_tokens=MAX_SUMMARY_TOKENS,
                 temperature=0.0,
+                include_markdown_instructions=False,
             )
 
             if summary_text and summary_text.strip():

@@ -16,7 +16,7 @@ from app.core.security import hash_password
 from app.services.audit_service import audit_service
 
 # Root OrgUnit name used to determine is_corp_member flag.
-CORP_OU_NAME = "Corp."
+CORP_OU_NAME = "Công ty (Company)"
 
 
 class UserService:

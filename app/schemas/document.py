@@ -111,6 +111,7 @@ class DocumentVersionRead(BaseModel):
     error_message: Optional[str] = None
     rule_version: str
     chunk_config_json: Optional[dict] = None
+    entity_detection_json: Optional[dict] = None
     created_at: datetime
     updated_at: datetime
 

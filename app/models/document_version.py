@@ -27,6 +27,8 @@ class DocumentVersion(Base, TimestampMixin):
     rule_version = Column(String(32), nullable=False, default="v1")
 
     chunk_config_json = Column(JSON, nullable=True)
+    # Full-document entity detection snapshot produced during ingest.
+    entity_detection_json = Column(JSON, nullable=True)
 
     document = relationship("Document", back_populates="versions", foreign_keys=[document_id])
     source_object = relationship("StorageObject", foreign_keys=[source_object_id])
@@ -37,4 +39,11 @@ class DocumentVersion(Base, TimestampMixin):
         back_populates="version",
         cascade="all, delete-orphan",
         foreign_keys="DocumentChunk.document_version_id",
+    )
+    entity_actions = relationship(
+        "DocumentEntityAction",
+        back_populates="version",
+        cascade="all, delete-orphan",
+        foreign_keys="DocumentEntityAction.document_version_id",
+        order_by="DocumentEntityAction.sort_order",
     )
