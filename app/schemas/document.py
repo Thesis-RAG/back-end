@@ -110,6 +110,10 @@ class DocumentVersionRead(BaseModel):
     embed_status: str
     error_message: Optional[str] = None
     rule_version: str
+    policy_profile: str = "enterprise_secure"
+    policy_version: str = "policy-v1"
+    resolved_rules_json: Optional[list] = None
+    confirmed_labels_json: Optional[list[str]] = None
     chunk_config_json: Optional[dict] = None
     entity_detection_json: Optional[dict] = None
     created_at: datetime
@@ -129,4 +133,7 @@ class PolicySnapshotRead(BaseModel):
     id: str
     document_version_id: str
     policy_version: str
+    policy_profile: str = "enterprise_secure"
+    resolved_rules_json: Optional[list] = None
+    confirmed_labels_json: Optional[list[str]] = None
     contract_json: dict

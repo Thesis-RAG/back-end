@@ -11,6 +11,7 @@ from app.models.org_unit_instance import OrgUnitInstance
 from app.models.position import Position
 from app.models.user import User
 from app.models.user_oui_position import UserOuiPosition
+from app.services.policy_rule_service import policy_rule_service
 
 
 CORP_OU_NAME = "Công ty (Company)"
@@ -292,6 +293,7 @@ class BootstrapService:
             db.flush()
         self._ensure_user_assignment(db, admin, root_oui, admin_position)
         self._ensure_default_users(db)
+        policy_rule_service.seed_defaults(db)
 
         db.commit()
 

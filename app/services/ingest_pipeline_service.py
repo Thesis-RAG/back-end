@@ -16,6 +16,7 @@ from app.models.document import Document
 from app.models.document_chunk import DocumentChunk
 from app.models.document_version import DocumentVersion
 from app.models.document_entity_action import DocumentEntityAction
+from app.models.policy_snapshot import DocumentPolicySnapshot
 from app.schemas.document import ChunkingConfig
 from app.services.audit_service import audit_service
 from app.services.chunker_service import ChunkConfig, chunker_service
@@ -134,36 +135,56 @@ class IngestPipelineService:
 
             # Detect the complete document once and retain the snapshot for
             # the upload editor and the direct-file entity access gate.
-            full_detection = entity_policy_service.detect_full_text(parsed.full_text, db)
-            version.entity_detection_json = {
-                "entity_types": full_detection["entity_types"],
-                "entities": full_detection["entities"],
-            }
             configured_actions = db.query(DocumentEntityAction).filter(
                 DocumentEntityAction.document_version_id == version.id,
                 DocumentEntityAction.enabled.is_(True),
             ).all()
             configured_by_type = {row.entity_type: row for row in configured_actions}
-            if not configured_actions:
-                # API clients that do not yet send an editor payload remain
-                # compatible and default detected entities to full visibility.
-                for sort_order, entity_type in enumerate(full_detection["entity_types"]):
-                    row = DocumentEntityAction(
-                        document_version_id=version.id,
-                        entity_type=entity_type,
-                        label=entity_type,
-                        action="full",
-                        source="gliner",
-                        enabled=True,
-                        sort_order=sort_order,
-                    )
-                    db.add(row)
-                    configured_by_type[entity_type] = row
+            full_detection = entity_policy_service.detect_full_text(parsed.full_text, db)
+            confirmed_labels = sorted(
+                set(full_detection["entity_types"]) & set(configured_by_type)
+            )
+            version.entity_detection_json = {
+                "entity_types": confirmed_labels,
+                "confirmed_labels": confirmed_labels,
+                "entities": full_detection["entities"],
+            }
             for entity_type, row in configured_by_type.items():
                 row.detection_count = sum(
                     1 for entity in full_detection["entities"]
                     if entity.get("label") == entity_type
                 )
+            version.confirmed_labels_json = confirmed_labels
+            snapshot = db.query(DocumentPolicySnapshot).filter(
+                DocumentPolicySnapshot.document_version_id == version.id,
+            ).first()
+            if snapshot:
+                snapshot.confirmed_labels_json = confirmed_labels
+                contract = dict(snapshot.contract_json or {})
+                contract["confirmed_labels"] = confirmed_labels
+                snapshot.contract_json = contract
+            db.commit()
+
+            policy_action_summary = {"block": 0, "mask": 0, "full": 0}
+            for row in configured_by_type.values():
+                if row.entity_type in confirmed_labels:
+                    policy_action_summary[row.action] = policy_action_summary.get(row.action, 0) + 1
+            audit_service.log_action(
+                db,
+                trace_id=job.trace_id,
+                user_id=job.created_by_user_id,
+                action="policy.document_rules_applied",
+                resource_type="document_version",
+                resource_id=version.id,
+                decision="allow",
+                job_id=job.id,
+                output_json={
+                    "policy_profile": version.policy_profile,
+                    "policy_version": version.policy_version,
+                    "confirmed_labels": confirmed_labels,
+                    "action_summary": policy_action_summary,
+                },
+            )
             db.commit()
 
             # ── chunk ─────────────────────────────────────────────────
@@ -181,7 +202,9 @@ class IngestPipelineService:
                 extract_realtime_batch_detailed,
             )
             chunk_details = extract_realtime_batch_detailed(
-                [c.get("chunk_text") or "" for c in chunks], db=db
+                [c.get("chunk_text") or "" for c in chunks],
+                db=db,
+                labels=confirmed_labels,
             )
             for chunk_dict, detail in zip(chunks, chunk_details):
                 metadata_json = chunk_dict.setdefault("metadata_json", {})
@@ -196,9 +219,16 @@ class IngestPipelineService:
                 )
                 metadata_json["entity_types"] = sorted({
                     str(value) for value in (detail.get("entity_types") or [])
-                })
+                } & set(confirmed_labels))
                 metadata_json["detected_entities"] = detail.get("entities") or []
                 metadata_json["sensitivity_flags"] = sorted(detail.get("flags") or [])
+                metadata_json["confirmed_labels"] = confirmed_labels
+                metadata_json["label_set_version"] = version.policy_version
+                metadata_json["entity_actions"] = {
+                    label: configured_by_type[label].action
+                    for label in metadata_json["entity_types"]
+                    if label in configured_by_type
+                }
                 # Preserve the old chunker/LLM result separately so changing
                 # the document level later can reproduce this decision.
                 metadata_json["llm_chunk_sensitivity"] = max(
@@ -266,6 +296,10 @@ class IngestPipelineService:
                     "chunk_sensitivity":     meta_json.get("chunk_sensitivity", doc.sensitivity),
                     "llm_chunk_sensitivity": meta_json.get("llm_chunk_sensitivity", doc.sensitivity),
                     "entity_types": ",".join(meta_json.get("entity_types") or []),
+                    "confirmed_labels": ",".join(meta_json.get("confirmed_labels") or []),
+                    "label_set_version": meta_json.get("label_set_version", version.policy_version),
+                    "policy_profile": version.policy_profile,
+                    "policy_version": version.policy_version,
                 }
                 chroma_service.upsert_chunk(
                     chunk_id=chunk_model.id,

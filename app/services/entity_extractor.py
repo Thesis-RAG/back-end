@@ -70,7 +70,7 @@ _BUILTIN_ENTITY_FLAGS: dict[str, list[str]] = {
 
 # Available before a newly uploaded file has persisted action rows. This is
 # the shared baseline used by upload preview, ingestion, and query detection.
-_DEFAULT_GLINER_LABELS: tuple[str, ...] = (
+_FALLBACK_GLINER_LABELS: tuple[str, ...] = (
     "person_name", "organization", "address", "salary", "money", "project",
     "contract", "email", "phone", "account_number", "credential", "date",
 )
@@ -182,37 +182,45 @@ def adjust_chunk_sensitivity(
 
 _cache: dict[str, list] = {}
 _cache_ts: float = 0.0
+_cache_source: str | None = None
 _cache_lock: threading.Lock = threading.Lock()
 _CACHE_TTL = 300.0  # 5 minutes
 
 
 # Return (active_gliner_labels, entity_flags_map) from the TTL cache, refreshing from DB when stale.
 def _refresh_cache(db=None) -> tuple[list[str], dict[str, list[str]]]:
-    global _cache, _cache_ts
+    global _cache, _cache_ts, _cache_source
     now = time.monotonic()
 
-    if now - _cache_ts < _CACHE_TTL and _cache:
+    requested_source = "db" if db is not None else "fallback"
+    if now - _cache_ts < _CACHE_TTL and _cache and _cache_source == requested_source:
         return _cache["labels"], _cache["flags"]
 
     if db is None:
+        _cache_source = "fallback"
         return (
-            _cache.get("labels", list(_DEFAULT_GLINER_LABELS)),
+            _cache.get("labels", list(_FALLBACK_GLINER_LABELS)),
             _cache.get("flags", {**_BUILTIN_ENTITY_FLAGS, **_DEFAULT_GLINER_FLAGS}),
         )
 
     with _cache_lock:
         # Double-check after acquiring lock
-        if now - _cache_ts < _CACHE_TTL and _cache:
+        if now - _cache_ts < _CACHE_TTL and _cache and _cache_source == "db":
             return _cache["labels"], _cache["flags"]
         try:
-            from app.models.document_entity_action import DocumentEntityAction
+            from app.models.entity_policy_rule import EntityPolicyRule
             rows = (
-                db.query(DocumentEntityAction.entity_type, DocumentEntityAction.metadata_json)
-                .filter(DocumentEntityAction.enabled.is_(True))
+                db.query(EntityPolicyRule.entity_key, EntityPolicyRule.metadata_json)
+                .filter(
+                    EntityPolicyRule.policy_profile == "enterprise_secure",
+                    EntityPolicyRule.enabled.is_(True),
+                )
                 .all()
             )
 
-            labels = sorted({*(_DEFAULT_GLINER_LABELS), *(str(entity_type) for entity_type, _ in rows if entity_type)})
+            # The database is the source of truth. No global hard-coded labels
+            # are merged when a DB session is available.
+            labels = sorted({str(entity_type) for entity_type, _ in rows if entity_type})
             db_flags = {
                 str(entity_type): list((metadata or {}).get("boolean_labels") or [])
                 for entity_type, metadata in rows
@@ -224,6 +232,7 @@ def _refresh_cache(db=None) -> tuple[list[str], dict[str, list[str]]]:
 
             _cache = {"labels": labels, "flags": combined_flags}
             _cache_ts = now
+            _cache_source = "db"
             logger.debug(
                 "Entity cache refreshed: %d GLiNER labels, %d flag mappings",
                 len(labels), len(combined_flags),
@@ -232,15 +241,16 @@ def _refresh_cache(db=None) -> tuple[list[str], dict[str, list[str]]]:
             logger.warning("Failed to refresh entity cache: %s", exc)
 
     return (
-        _cache.get("labels", list(_DEFAULT_GLINER_LABELS)),
+            _cache.get("labels", list(_FALLBACK_GLINER_LABELS)),
         _cache.get("flags", {**_BUILTIN_ENTITY_FLAGS, **_DEFAULT_GLINER_FLAGS}),
     )
 
 
 # Force a cache refresh on the next call; invoke after creating or deleting entity types.
 def invalidate_label_cache() -> None:
-    global _cache_ts
+    global _cache_ts, _cache_source
     _cache_ts = 0.0
+    _cache_source = None
 
 
 # ── GLiNER lazy loader ────────────────────────────────────────────────────────
@@ -270,9 +280,11 @@ def _get_gliner():
 # ── Layer 1: Regex extraction ─────────────────────────────────────────────────
 
 # Extract structured PII entities from text using regex patterns (Layer 1).
-def extract_structured_entities(text: str) -> list[dict]:
+def extract_structured_entities(text: str, allowed_labels: set[str] | None = None) -> list[dict]:
     results = []
     for label, pattern in REGEX_PATTERNS.items():
+        if allowed_labels is not None and label not in allowed_labels:
+            continue
         for m in pattern.finditer(text):
             value = m.group(1) if m.groups() else m.group(0)
             results.append({
@@ -382,6 +394,7 @@ def extract_realtime_batch_detailed(
     *,
     db=None,
     threshold: float = 0.3,
+    labels: list[str] | set[str] | None = None,
 ) -> list[dict]:
     """Return structured entities, GLiNER entities, types and boolean flags.
 
@@ -391,11 +404,14 @@ def extract_realtime_batch_detailed(
     """
     if not texts:
         return []
-    gliner_labels, entity_flags = _refresh_cache(db)
+    gliner_labels, entity_flags = _refresh_cache(db) if labels is None else (
+        sorted(set(labels)), _refresh_cache(db)[1]
+    )
     model = _get_gliner() if gliner_labels else None
     results: list[dict] = []
     for text in texts:
-        structured = extract_structured_entities(text)
+        allowed_labels = set(gliner_labels)
+        structured = extract_structured_entities(text, allowed_labels)
         freetext: list[dict] = []
         if model is not None:
             try:
@@ -407,11 +423,11 @@ def extract_realtime_batch_detailed(
         entities = structured + freetext
         for entity in entities:
             entity["flags"] = list(entity_flags.get(entity.get("label"), []))
-        labels = detect_boolean_labels(text, entities, entity_flags)
+        boolean_summary = detect_boolean_labels(text, entities, entity_flags)
         results.append({
             "entities": entities,
             "entity_types": {str(e.get("label")) for e in entities if e.get("label")},
-            "flags": {key for key, value in labels.items() if value},
+            "flags": {key for key, value in boolean_summary.items() if value},
         })
     return results
 
@@ -427,7 +443,7 @@ def run_pipeline(
 ) -> dict:
     gliner_labels, entity_flags = _refresh_cache(db)
 
-    structured = extract_structured_entities(text)
+    structured = extract_structured_entities(text, set(gliner_labels))
     freetext   = extract_freetext_entities(text, gliner_labels, threshold=gliner_threshold)
     all_entities = structured + freetext
 

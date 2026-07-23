@@ -36,6 +36,7 @@ from app.services.sensitivity_levels import MIN_SENSITIVITY
 from app.services.storage_service import storage_service
 from app.services.user_service import user_service as _user_service
 from app.services.entity_policy_service import normalize_actions
+from app.services.policy_rule_service import DEFAULT_POLICY_PROFILE, policy_rule_service
 
 logger = logging.getLogger(__name__)
 
@@ -86,8 +87,45 @@ class DocumentService:
 
     # Persist a neutral snapshot for compatibility; runtime contracts are
     # generated from the version's per-entity actions during retrieval.
-    def _entity_action_snapshot(self, doc: Document) -> dict:
-        return {"mode": "entity_actions", "document_id": doc.id}
+    def _apply_policy_snapshot(self, db: Session, version: DocumentVersion, policy: dict) -> None:
+        """Copy global rules onto a version so later rule edits cannot mutate it."""
+        db.query(DocumentEntityAction).filter(
+            DocumentEntityAction.document_version_id == version.id
+        ).delete(synchronize_session=False)
+        for sort_order, rule in enumerate(policy.get("resolved_rules") or []):
+            metadata = dict(rule.get("metadata_json") or {})
+            metadata.update({
+                "policy_profile": policy.get("policy_profile"),
+                "policy_version": policy.get("policy_version"),
+                "priority": rule.get("priority", sort_order),
+            })
+            db.add(DocumentEntityAction(
+                document_version_id=version.id,
+                entity_type=rule["entity_key"],
+                label=rule.get("display_name") or rule["entity_key"],
+                action=rule.get("action") or "full",
+                source=rule.get("detection_source") or "manual",
+                enabled=True,
+                sort_order=sort_order,
+                scope_oui_ids=rule.get("scope_oui_ids") or [],
+                scope_position_ids=rule.get("scope_position_ids") or [],
+                metadata_json=metadata,
+            ))
+        version.policy_profile = policy.get("policy_profile") or DEFAULT_POLICY_PROFILE
+        version.policy_version = policy.get("policy_version") or settings.default_policy_version
+        version.rule_version = version.policy_version
+        version.resolved_rules_json = policy.get("resolved_rules") or []
+        version.confirmed_labels_json = policy.get("confirmed_labels") or []
+
+    def _entity_action_snapshot(self, version: DocumentVersion, policy: dict) -> dict:
+        return {
+            "mode": "global_rules",
+            "document_version_id": version.id,
+            "policy_profile": policy.get("policy_profile"),
+            "policy_version": policy.get("policy_version"),
+            "resolved_rules": policy.get("resolved_rules") or [],
+            "confirmed_labels": policy.get("confirmed_labels") or [],
+        }
 
     # ── CRUD ──────────────────────────────────────────────────────────────────
 
@@ -321,6 +359,8 @@ class DocumentService:
         if chunking_config is None:
             chunking_config = ChunkingConfig()
 
+        policy = policy_rule_service.snapshot(db, DEFAULT_POLICY_PROFILE)
+
         last_no = self.docs.get_max_version_no(db, doc.id)
         version_no = last_no + 1
         checksum = storage_service.checksum(raw_bytes)
@@ -342,33 +382,26 @@ class DocumentService:
             parse_status="pending",
             chunk_status="pending",
             embed_status="pending",
-            rule_version=settings.default_policy_version,
+            rule_version=policy["policy_version"],
+            policy_profile=policy["policy_profile"],
+            policy_version=policy["policy_version"],
+            resolved_rules_json=policy["resolved_rules"],
+            confirmed_labels_json=[],
             chunk_config_json=chunking_config.to_json(),
         )
         self.versions.create(db, version)
-
-        for sort_order, action in enumerate(normalize_actions(entity_actions or [])):
-            db.add(DocumentEntityAction(
-                document_version_id=version.id,
-                entity_type=action["entity_type"],
-                label=action.get("label"),
-                action=action["action"],
-                source=action.get("source", "manual"),
-                enabled=action.get("enabled", True),
-                detection_count=action.get("detection_count", 0),
-                sort_order=sort_order,
-                scope_oui_ids=action.get("scope_oui_ids") or [],
-                scope_position_ids=action.get("scope_position_ids") or [],
-                metadata_json=action.get("metadata_json") or {},
-            ))
+        self._apply_policy_snapshot(db, version, policy)
 
         doc.current_version_id = version.id
         doc.status = "uploaded"
 
         snapshot = DocumentPolicySnapshot(
             document_version_id=version.id,
-            policy_version=settings.default_policy_version,
-            contract_json=self._entity_action_snapshot(doc),
+            policy_version=policy["policy_version"],
+            policy_profile=policy["policy_profile"],
+            resolved_rules_json=policy["resolved_rules"],
+            confirmed_labels_json=[],
+            contract_json=self._entity_action_snapshot(version, policy),
         )
         db.add(snapshot)
 
@@ -422,6 +455,37 @@ class DocumentService:
         db.commit()
         db.refresh(job)
         return job
+
+    def reprocess_policy(
+        self, db: Session, user: User, doc_id: str, version_id: str, trace_id: str,
+    ):
+        """Refresh one version's policy snapshot, then explicitly re-run ingest."""
+        doc = self.docs.get_by_id(db, doc_id)
+        if not doc:
+            raise HTTPException(status_code=404, detail="Document not found")
+        if not self._is_corp_member(db, user):
+            raise HTTPException(status_code=403, detail="Corp-level required")
+        version = self.versions.get_by_id(db, version_id)
+        if not version or version.document_id != doc.id:
+            raise HTTPException(status_code=404, detail="Version not found")
+
+        policy = policy_rule_service.snapshot(db, DEFAULT_POLICY_PROFILE)
+        self._apply_policy_snapshot(db, version, policy)
+        snapshot = db.query(DocumentPolicySnapshot).filter(
+            DocumentPolicySnapshot.document_version_id == version.id,
+        ).first()
+        if snapshot:
+            snapshot.policy_profile = policy["policy_profile"]
+            snapshot.policy_version = policy["policy_version"]
+            snapshot.resolved_rules_json = policy["resolved_rules"]
+            snapshot.confirmed_labels_json = []
+            snapshot.contract_json = self._entity_action_snapshot(version, policy)
+        version.entity_detection_json = None
+        version.confirmed_labels_json = []
+        db.commit()
+        return self.start_ingest(
+            db, user, doc_id, version_id=version_id, force_new=True, trace_id=trace_id,
+        )
 
     # Delete a document and all its associated versions, chunks, jobs, and FGA tuples.
     def delete_document(self, db: Session, user: User, doc_id: str, trace_id: str) -> None:

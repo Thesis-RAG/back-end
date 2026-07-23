@@ -25,6 +25,10 @@ class DocumentVersion(Base, TimestampMixin):
     embed_status = Column(String(32), nullable=False, default="pending")
     error_message = Column(Text, nullable=True)
     rule_version = Column(String(32), nullable=False, default="v1")
+    policy_profile = Column(String(64), nullable=False, default="enterprise_secure")
+    policy_version = Column(String(32), nullable=False, default="policy-v1")
+    resolved_rules_json = Column(JSON, nullable=True)
+    confirmed_labels_json = Column(JSON, nullable=True)
 
     chunk_config_json = Column(JSON, nullable=True)
     # Full-document entity detection snapshot produced during ingest.

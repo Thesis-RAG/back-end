@@ -7,6 +7,7 @@ from app.models.document_entity_access_request import DocumentEntityAccessReques
 from app.models.document_entity_action import DocumentEntityAction
 from app.models.document_chunk import DocumentChunk
 from app.models.document_version import DocumentVersion
+from app.models.entity_policy_rule import EntityPolicyRule
 from app.models.job import Job
 from app.models.job_step import JobStep
 from app.models.message import Message
@@ -31,6 +32,7 @@ __all__ = [
     "DocumentEntityAction",
     "DocumentChunk",
     "DocumentVersion",
+    "EntityPolicyRule",
     "DocumentPolicySnapshot",
     "Job",
     "JobStep",
