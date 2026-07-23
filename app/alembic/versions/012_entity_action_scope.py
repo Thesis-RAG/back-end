@@ -23,7 +23,14 @@ def upgrade() -> None:
         if name not in columns:
             op.add_column(
                 "document_entity_actions",
-                sa.Column(name, sa.JSON(), nullable=False, server_default=sa.text("'[]'")),
+                # MySQL requires a parenthesized expression for JSON defaults.
+                # A bare string literal is rejected with ERROR 1101.
+                sa.Column(
+                    name,
+                    sa.JSON(),
+                    nullable=False,
+                    server_default=sa.text("(JSON_ARRAY())"),
+                ),
             )
 
 
