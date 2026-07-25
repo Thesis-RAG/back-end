@@ -72,6 +72,7 @@ class DocumentRead(BaseModel):
     tags: list[str] = []
     status: str
     current_version_id: Optional[str] = None
+    file_name: Optional[str] = None    # ← From current_version, for file-extension/icon display only.
     version_count: int = 0
     created_at: datetime
     updated_at: datetime
@@ -83,12 +84,8 @@ class DocumentRead(BaseModel):
             data.oui_ids = [o.id for o in (obj.ouis or [])]
         if hasattr(obj, "owner") and obj.owner:
             data.owner_name = obj.owner.name
-        # Derive document_type from the uploaded file extension when not explicitly set.
-        if data.document_type == "general" and hasattr(obj, "current_version") and obj.current_version:
-            fname: str = obj.current_version.file_name or ""
-            dot = fname.rfind(".")
-            if dot != -1:
-                data.document_type = fname[dot + 1:].lower()
+        if hasattr(obj, "current_version") and obj.current_version:
+            data.file_name = obj.current_version.file_name
         return data
 
 

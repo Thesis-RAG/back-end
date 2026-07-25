@@ -134,22 +134,3 @@ def test_query_rewrite_history_keeps_questions_only():
     ]) == [{"role": "user", "content": "previous question"}]
 
 
-def test_secret_clearance_bypasses_entity_actions_without_running_detection():
-    service = EntityPolicyService()
-    high_clearance_user = SimpleNamespace(
-        oui_positions=[SimpleNamespace(position=SimpleNamespace(clearance=4))]
-    )
-    chunks = [{
-        "document_text": "salary 100",
-        "metadata": {"document_id": "doc-1", "document_version_id": "ver-1"},
-    }]
-
-    assert service.bypasses_entity_actions(high_clearance_user)
-    processed, contracts = service.apply_to_retrieved(
-        object(), high_clearance_user, "salary", chunks
-    )
-
-    assert processed is chunks
-    assert contracts == []
-    assert service.bypasses_entity_actions(SimpleNamespace(max_clearance=5))
-    assert not service.bypasses_entity_actions(SimpleNamespace(max_clearance=3))

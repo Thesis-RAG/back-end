@@ -242,23 +242,6 @@ def view_document_file(
     if not version or not version.source_object:
         raise HTTPException(status_code=404, detail="File not found")
 
-    blocked_entity_types = entity_policy_service.blocked_types_for_version(
-        db, version.id, current_user
-    )
-    if blocked_entity_types and not entity_policy_service.has_entity_access(
-        db, current_user, document_id, version.id, blocked_entity_types
-    ):
-        raise HTTPException(
-            status_code=403,
-            detail={
-                "code": "entity_access_required",
-                "document_id": document_id,
-                "document_version_id": version.id,
-                "entity_types": sorted(blocked_entity_types),
-                "message": "Entity access approval is required to view this file",
-            },
-        )
-
     src_obj = version.source_object
     data = StorageRepository().get_bytes(src_obj.bucket, src_obj.object_key)
     encoded_name = urllib.parse.quote(src_obj.original_filename)

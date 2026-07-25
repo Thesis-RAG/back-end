@@ -96,5 +96,7 @@ curl https://api.example.com/health
 docker compose -f docker-compose.prod.yml logs -f api
 ```
 
-Do not expose MySQL, Redis, PostgreSQL, MinIO, ChromaDB, or OpenFGA ports in the
-EC2 security group. Keep `.env` outside Git and back up the Docker volumes.
+Do not expose MySQL, Redis, PostgreSQL, MinIO, ChromaDB, OpenFGA, or Neo4j ports
+in the EC2 security group — Neo4j's Bolt/Browser ports have no app-level auth
+of their own, unlike the API. Keep `.env` outside Git and back up the Docker
+volumes (including `neo4j_data`, which holds the ontology graph).

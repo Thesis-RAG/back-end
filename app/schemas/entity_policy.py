@@ -8,6 +8,16 @@ from pydantic import BaseModel, ConfigDict, Field
 
 EntityAction = Literal["block", "full", "mask"]
 DetectionSource = Literal["gliner", "regex", "manual"]
+MaskStyle = Literal["full", "partial"]
+MaskPosition = Literal["head", "center", "tail"]
+
+
+class ScopePair(BaseModel):
+    # oui_id/position_id null means "any" on that dimension. A pair fully
+    # replaces the old (oui_ids × position_ids) rectangle — each pair is one
+    # explicit (unit, role) combination, not cross-multiplied against others.
+    oui_id: Optional[str] = None
+    position_id: Optional[str] = None
 
 
 class PolicyRuleInput(BaseModel):
@@ -15,12 +25,56 @@ class PolicyRuleInput(BaseModel):
     display_name: str = Field(..., min_length=1, max_length=255)
     group_name: str = Field(default="general", min_length=1, max_length=128)
     detection_source: DetectionSource = "manual"
+    # Legacy single-tier field, kept for the ingest-time snapshot copy.
+    # Live chat/file resolution uses the tiered scopes below.
     action: EntityAction = "full"
+    # Absolute sensitivity level (1-5, same scale as Document.sensitivity)
+    # this entity type carries — feeds chunk_sensitivity computation at
+    # ingest/resync time (see entity_extractor.compute_chunk_sensitivity).
+    sensitivity: int = Field(default=2, ge=1, le=5)
     enabled: bool = True
     scope_oui_ids: list[str] = Field(default_factory=list)
     scope_position_ids: list[str] = Field(default_factory=list)
     priority: int = Field(default=100, ge=0, le=100000)
     metadata_json: dict = Field(default_factory=dict)
+
+    # allow: always full, checked first. mask: mask + per-message appeal,
+    # checked second. Anyone matching neither is hard-blocked (fallback,
+    # not a configurable scope) — enforced by resolve_tier(), not here.
+    allow_scope_pairs: list[ScopePair] = Field(default_factory=list)
+    mask_scope_pairs: list[ScopePair] = Field(default_factory=list)
+
+    mask_style: MaskStyle = "full"
+    mask_position: Optional[MaskPosition] = None
+
+
+class TranslateEntityKeyRequest(BaseModel):
+    text: str = Field(..., min_length=1, max_length=255)
+
+
+class TranslateEntityKeyResponse(BaseModel):
+    entity_key: str
+
+
+class PolicyGroupRead(BaseModel):
+    model_config = ConfigDict(from_attributes=True)
+
+    id: str
+    policy_profile: str
+    name: str
+    created_at: datetime
+    updated_at: datetime
+
+
+class PolicyGroupCreate(BaseModel):
+    name: str = Field(..., min_length=1, max_length=128)
+
+
+# Overwrites (not merges) allow_scope_pairs/mask_scope_pairs on every rule
+# currently in the target group — see PolicyRuleService.apply_group_scope.
+class ApplyGroupScopeRequest(BaseModel):
+    allow_scope_pairs: list[ScopePair] = Field(default_factory=list)
+    mask_scope_pairs: list[ScopePair] = Field(default_factory=list)
 
 
 class PolicyRuleRead(PolicyRuleInput):
@@ -30,6 +84,16 @@ class PolicyRuleRead(PolicyRuleInput):
     policy_profile: str
     created_at: datetime
     updated_at: datetime
+
+    # Live result of policy_rule_service.compute_graph_tiers() — the same
+    # allow>mask>block fan-out the ontology graph is built from (see
+    # ontology_sync_service.py). Attached onto the ORM object by the
+    # endpoints below before serialization; NOT derived from `action`
+    # above, which is a separate legacy single-tier field only used for
+    # the ingest-time snapshot.
+    resolved_allow: Optional[bool] = None
+    resolved_mask: Optional[bool] = None
+    resolved_block: Optional[bool] = None
 
 
 class PolicyPreviewRule(BaseModel):

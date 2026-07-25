@@ -15,6 +15,7 @@ from app.models.org_unit_instance import OrgUnitInstance
 from app.models.position import Position
 from app.models.user_oui_position import UserOuiPosition
 from app.fga.adapter import fga_adapter
+from app.services.ontology_sync_service import ontology_sync_service
 from app.services.oui_tree_service import oui_tree_service
 from app.services.user_service import user_service as _user_service
 
@@ -96,6 +97,7 @@ def create_org_unit(
     db.add(unit)
     db.commit()
     db.refresh(unit)
+    ontology_sync_service.sync_org_unit(unit)
     return {"id": unit.id, "name": unit.name, "parent_id": unit.parent_id}
 
 
@@ -118,6 +120,7 @@ def delete_org_unit(
         raise HTTPException(status_code=400, detail="Cannot delete OU that has instances")
     db.delete(unit)
     db.commit()
+    ontology_sync_service.delete_org_unit(ou_id)
     return {"status": "deleted"}
 
 
@@ -170,6 +173,8 @@ def create_oui(
     for p in parents:
         fga_adapter.link_oui_parent(instance.id, p.id)
 
+    ontology_sync_service.sync_org_unit_instance(instance, db)
+
     return {
         "id": instance.id,
         "name": instance.name,
@@ -212,6 +217,7 @@ def update_oui(
 
     # Re-sync document FGA tuples so stale viewer grants are cleaned up.
     _resync_docs_for_oui(db, oui_id)
+    ontology_sync_service.sync_org_unit_instance(instance, db)
 
     return {
         "id": instance.id,
@@ -243,6 +249,7 @@ def delete_oui(
         fga_adapter.unlink_oui_parent(oui_id, p.id)
     db.delete(instance)
     db.commit()
+    ontology_sync_service.delete_org_unit_instance(oui_id)
     return {"status": "deleted"}
 
 
@@ -278,6 +285,7 @@ def create_position(
     db.add(pos)
     db.commit()
     db.refresh(pos)
+    ontology_sync_service.sync_position(pos)
     return {"id": pos.id, "name": pos.name, "ou_id": pos.ou_id, "clearance": pos.clearance}
 
 
@@ -302,6 +310,7 @@ def update_position(
 
     # Clearance changed: re-sync all documents owned by OUIs using this position.
     _resync_docs_for_position(db, position_id)
+    ontology_sync_service.sync_position(pos)
 
     return {"id": pos.id, "name": pos.name, "clearance": pos.clearance}
 
@@ -332,6 +341,7 @@ def delete_position(
 
     db.delete(pos)
     db.commit()
+    ontology_sync_service.delete_position(position_id)
     return {"status": "deleted", "position_id": position_id}
 
 
@@ -364,6 +374,9 @@ def assign_user_to_oui(
     require_admin(current_user, db)
 
     # Validate
+    user = db.get(User, payload.user_id)
+    if not user:
+        raise HTTPException(status_code=404, detail="User not found")
     oui = db.get(OrgUnitInstance, payload.oui_id)
     if not oui:
         raise HTTPException(status_code=404, detail="OUI not found")
@@ -392,6 +405,7 @@ def assign_user_to_oui(
     db.commit()
 
     fga_adapter.add_oui_member(payload.user_id, payload.oui_id)
+    ontology_sync_service.sync_user_assignment(user, payload.oui_id, payload.position_id)
 
     return {"status": "assigned", "user_id": payload.user_id, "oui": oui.name, "position": pos.name}
 
@@ -415,6 +429,7 @@ def unassign_user_from_oui(
     db.commit()
 
     fga_adapter.remove_oui_member(payload.user_id, payload.oui_id)
+    ontology_sync_service.delete_user_assignment(payload.user_id, payload.oui_id)
 
     return {"status": "unassigned"}
 
@@ -441,6 +456,10 @@ def change_position(
 
     record.position_id = payload.position_id
     db.commit()
+
+    user = db.get(User, user_id)
+    if user:
+        ontology_sync_service.sync_user_assignment(user, oui_id, payload.position_id)
 
     return {"status": "updated"}
 

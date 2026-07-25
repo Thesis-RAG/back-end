@@ -607,25 +607,11 @@ Quy tắc chunk:
 - GIỮ NGUYÊN các ký hiệu định dạng markdown: **chữ đậm**, *chữ nghiêng*, | bảng |
   Tuyệt đối không được xóa hay sửa các ký tự *, **, | trong chunk_text
 
-Phân loại độ nhạy cảm cho mỗi chunk (field "sensitivity", thang 1–5):
-  1 = Công khai  — thông tin ai cũng biết, không gây hại nếu lộ
-  2 = Nội bộ    — thông tin chung trong nội bộ công ty
-  3 = Bảo mật   — thông tin nhạy cảm, chỉ một số bộ phận biết
-  4 = Hạn chế   — dữ liệu cá nhân, lương thưởng, hợp đồng cụ thể, số liệu tài chính chi tiết
-  5 = Tuyệt mật — bí mật kinh doanh cốt lõi, chiến lược M&A, thông tin pháp lý tuyệt mật
-
-Tài liệu này có sensitivity = {{doc_sensitivity}}.
-Chunk PHẢI được đánh riêng theo nội dung thực tế. Quy tắc:
-- Chunk chứa thông tin tổng quan/quy trình chung → có thể giảm 1 bậc (doc_sensitivity - 1)
-- Chunk chứa số liệu lương/thưởng, họ tên + CCCD/tài khoản, điều khoản hợp đồng cụ thể, chiến lược kinh doanh → tăng 1 bậc (doc_sensitivity + 1)
-- Phần mục lục, định nghĩa, phạm vi áp dụng → giảm 1 bậc
-- Chunk chỉ được lệch tối đa ±1 so với doc_sensitivity, và phải nằm trong thang 1-5.
-
 ĐỊNH DẠNG TRẢ VỀ — JSON, không giải thích thêm, đúng cấu trúc sau:
 {{
   "outline_checklist": ["Điều (hoặc Phần/Mục/Chương/...) 1 - ...", "Điều (hoặc Phần/Mục/Chương/...) 2 - ...", "..."],
   "chunks": [
-    {{"section_heading": "...", "chunk_text": "...", "sensitivity": 2}}
+    {{"section_heading": "...", "chunk_text": "..."}}
   ]
 }}
 
@@ -746,8 +732,6 @@ def _chunk_with_llm(parsed: ParsedDocument, cfg: ChunkConfig, doc_sensitivity: i
     for idx, item in enumerate(items):
         chunk_text  = (item.get("chunk_text") or "").strip()
         heading     = (item.get("section_heading") or "").strip()
-        raw_sen     = int(item.get("sensitivity") or doc_sensitivity)
-        sensitivity = max(1, min(5, max(doc_sensitivity - 1, min(doc_sensitivity + 1, raw_sen))))
         if not chunk_text:
             continue
 
@@ -770,7 +754,7 @@ def _chunk_with_llm(parsed: ParsedDocument, cfg: ChunkConfig, doc_sensitivity: i
                     page_end=pg_end,
                     total_chunks=len(items),
                     mode="llm_structured",
-                    sensitivity=sensitivity,
+                    sensitivity=doc_sensitivity,
                 ))
             continue
 
@@ -782,7 +766,7 @@ def _chunk_with_llm(parsed: ParsedDocument, cfg: ChunkConfig, doc_sensitivity: i
             page_end=pg_end,
             total_chunks=len(items),
             mode="llm_structured",
-            sensitivity=sensitivity,
+            sensitivity=doc_sensitivity,
         ))
 
     return results

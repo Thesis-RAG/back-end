@@ -65,6 +65,14 @@ class Settings(BaseSettings):
 
     llm_timeout_seconds: int = 30
 
+    # Ontology graph (Neo4j) — the enterprise-ontology visualization, merged
+    # in-process into this backend (app/services/ontology_sync_service.py,
+    # app/services/ontology_graph_service.py). No separate service, no
+    # shared-secret auth between services — it's all one process now.
+    neo4j_uri: str = "bolt://neo4j:7687"
+    neo4j_user: str = "neo4j"
+    neo4j_password: str = "ontology12345"
+
 
 # Module-level singleton; import this instance throughout the application.
 settings = Settings()

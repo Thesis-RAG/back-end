@@ -37,6 +37,9 @@ class AssistantMessage(BaseModel):
     status: Optional[str]
     createdAt: datetime
     appliedRules: list[dict] = Field(default_factory=list)
+    # Entity types masked with the 'require' tier somewhere in this message —
+    # union across all its sources, used to drive the "Yêu cầu xem" button.
+    requireEntityTypes: list[str] = Field(default_factory=list)
 
 
 class SourceRead(BaseModel):
@@ -51,6 +54,7 @@ class SourceRead(BaseModel):
     entityAccessRequired: Optional[bool] = False
     entityAccessGranted: Optional[bool] = False
     blockedEntityTypes: list[str] = []
+    requireEntityTypes: list[str] = []
 
 
 class MessagePostResponse(BaseModel):

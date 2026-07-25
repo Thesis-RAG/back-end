@@ -84,97 +84,39 @@ _DEFAULT_GLINER_FLAGS: dict[str, list[str]] = {
     "account_number": ["has_pii", "has_financial"],
 }
 
-# Only these entity types are safe enough to justify lowering a chunk's
-# sensitivity. This is intentionally a very small allowlist: a missing
-# sensitive entity must never turn a chunk into a less protected one.
-COMMON_PUBLIC_ENTITY_TYPES = frozenset({"date", "date_generic"})
-SENSITIVITY_PROTECTIVE_FLAGS = frozenset({
-    "has_pii", "has_financial", "has_credential", "has_legal",
-    "has_strategic", "has_hr",
-})
-
 # Keyword-based augmentation: catches in-text patterns GLiNER might miss
 _CREDENTIAL_RE = re.compile(r"(?i)\b(mật khẩu|password|api[_\s]?key|token|secret|otp)\b")
 _LEGAL_RE      = re.compile(r"(?i)\b(nghị định|thông tư|điều\s+\d+|luật|hợp đồng|quyết định số)\b")
 _STRATEGIC_RE  = re.compile(r"(?i)\b(chiến lược|kế hoạch mở rộng|sáp nhập|m&a|định hướng|roadmap)\b")
 
 # ── Sensitivity scoring ───────────────────────────────────────────────────────
-
-_FLAG_SENSITIVITY_WEIGHTS: dict[str, int] = {
-    "has_credential": 2,
-    "has_pii":        1,
-    "has_hr":         1,
-    "has_strategic":  1,
-    "has_financial":  1,
-    "has_legal":      0,
-}
-
-
-# Derive chunk-level sensitivity from doc sensitivity and detected boolean flags; result clamped to [1, 5].
-def compute_chunk_sensitivity(doc_sensitivity: int, labels: dict[str, bool]) -> int:
-    if not any(labels.values()):
-        # No entity evidence means no downgrade.  Lowering is handled by
-        # adjust_chunk_sensitivity and requires the strict public allowlist.
-        delta = 0
-    else:
-        raw = sum(_FLAG_SENSITIVITY_WEIGHTS.get(f, 0) for f, v in labels.items() if v)
-        delta = min(raw, 2)
-    return max(1, min(5, doc_sensitivity + delta))
-
-
-def _normalize_entity_label(value: object) -> str:
-    return re.sub(r"[^a-z0-9_]+", "_", str(value or "").strip().lower()).strip("_")
-
-
-def has_common_public_entity(
-    entities: list[dict] | None,
-    flags: set[str] | dict[str, bool] | None = None,
-) -> bool:
-    """Return whether a chunk is safe enough for the one-level reduction."""
-    detected = [
-        entity for entity in (entities or [])
-        if _normalize_entity_label(entity.get("label"))
-    ]
-    if not detected:
-        return False
-
-    labels = {_normalize_entity_label(entity.get("label")) for entity in detected}
-    if not labels.issubset(COMMON_PUBLIC_ENTITY_TYPES):
-        return False
-    # The downgrade must be based on GLiNER evidence, not only a regex hit.
-    if not any(str(entity.get("source") or "").lower() == "gliner" for entity in detected):
-        return False
-
-    if isinstance(flags, dict):
-        active_flags = {key for key, value in flags.items() if value}
-    else:
-        active_flags = set(flags or set())
-    return not (active_flags & SENSITIVITY_PROTECTIVE_FLAGS)
-
-
-def adjust_chunk_sensitivity(
-    doc_sensitivity: int,
-    original_chunk_sensitivity: int | None,
-    entities: list[dict] | None = None,
-    flags: set[str] | dict[str, bool] | None = None,
-) -> int:
-    """Apply GLiNER lowering without weakening the existing raise logic.
-
-    The original value is produced by the existing chunker/LLM logic. Values
-    above the document level are preserved exactly. Values below or equal to
-    the document level are lowered only for the strict common-public-entity
-    case; otherwise they are restored to the document level.
-    """
+# chunk_sensitivity is derived purely from which entity types were detected
+# in the chunk and each type's own (action, sensitivity) — not from the old
+# LLM per-chunk guess or boolean-flag weights.
+#
+#   entity_snapshot: {entity_type: {"action": "full"|"mask"|"block", "sensitivity": 1-5}}
+#   — one entry per confirmed entity type detected in the chunk. This is the
+#   exact shape persisted as chunk metadata_json["entity_policy_snapshot"] so
+#   a later doc-level sensitivity change can recompute without re-detecting.
+#
+# Rules (evaluated in order):
+#   1. No entity detected                       -> doc_sensitivity - 1
+#   2. Only "full"-action entities detected      -> doc_sensitivity
+#   3. Any "mask"/"block"-action entity detected -> max(sensitivity of every
+#      detected entity type, including "full" ones present in the same chunk)
+#      — independent of doc_sensitivity, so it may end up higher OR lower.
+def compute_chunk_sensitivity(doc_sensitivity: int, entity_snapshot: dict[str, dict] | None) -> int:
     document_level = max(1, min(5, int(doc_sensitivity or 1)))
-    original = document_level if original_chunk_sensitivity is None else max(
-        1, min(5, int(original_chunk_sensitivity))
-    )
-
-    if original > document_level:
-        return original
-    if has_common_public_entity(entities, flags):
+    snapshot = entity_snapshot or {}
+    if not snapshot:
         return max(1, document_level - 1)
-    return document_level
+
+    actions = {str(info.get("action") or "full") for info in snapshot.values()}
+    if actions <= {"full"}:
+        return document_level
+
+    levels = [max(1, min(5, int(info.get("sensitivity") or 1))) for info in snapshot.values()]
+    return max(1, min(5, max(levels)))
 
 
 # ── Combined entity cache (labels + flag mapping) ─────────────────────────────
@@ -360,7 +302,20 @@ def extract_realtime(
     return entities, {e["label"] for e in entities}
 
 
-# Run GLiNER on multiple texts in one sequential batch — avoids model reload overhead.
+# Run GLiNER's own batched inference() over ALL texts in a single forward
+# pass, instead of one model call per text. predict_entities(text, ...) is
+# just inference([text], ...)[0] under the hood — calling it once per chunk
+# pays the full per-call overhead (tokenize/collate/eval/dispatch) N times
+# instead of once, which is what made detection latency scale linearly with
+# top_k. Falls back to per-text predict_entities if the installed gliner
+# version lacks inference() (older releases only expose predict_entities).
+def _batch_predict(model, texts: list[str], labels: list[str], threshold: float) -> list[list[dict]]:
+    if hasattr(model, "inference"):
+        return model.inference(texts, labels, threshold=threshold, batch_size=max(1, len(texts)))
+    return [model.predict_entities(text, labels, threshold=threshold) for text in texts]
+
+
+# Run GLiNER on multiple texts in one batched forward pass.
 # Returns one set[str] of detected entity types per text.
 def extract_realtime_batch(
     texts: list[str],
@@ -377,16 +332,12 @@ def extract_realtime_batch(
     if model is None:
         return [set() for _ in texts]
 
-    results: list[set[str]] = []
     try:
-        for text in texts:
-            raw = model.predict_entities(text, gliner_labels, threshold=threshold)
-            results.append({e["label"] for e in raw})
+        batched = _batch_predict(model, texts, gliner_labels, threshold)
+        return [{e["label"] for e in raw} for raw in batched]
     except Exception as exc:
         logger.error("GLiNER batch inference error: %s", exc)
-        while len(results) < len(texts):
-            results.append(set())
-    return results
+        return [set() for _ in texts]
 
 
 def extract_realtime_batch_detailed(
@@ -408,18 +359,24 @@ def extract_realtime_batch_detailed(
         sorted(set(labels)), _refresh_cache(db)[1]
     )
     model = _get_gliner() if gliner_labels else None
-    results: list[dict] = []
-    for text in texts:
-        allowed_labels = set(gliner_labels)
-        structured = extract_structured_entities(text, allowed_labels)
-        freetext: list[dict] = []
-        if model is not None:
-            try:
-                freetext = model.predict_entities(text, gliner_labels, threshold=threshold)
+
+    # One batched GLiNER call across all chunks (see _batch_predict), then a
+    # cheap per-text loop for regex extraction + assembly.
+    freetext_by_text: list[list[dict]] = [[] for _ in texts]
+    if model is not None:
+        try:
+            batched = _batch_predict(model, texts, gliner_labels, threshold)
+            for i, freetext in enumerate(batched):
                 for entity in freetext:
                     entity["source"] = "gliner"
-            except Exception as exc:
-                logger.debug("GLiNER detailed extraction failed: %s", exc)
+                freetext_by_text[i] = freetext
+        except Exception as exc:
+            logger.debug("GLiNER batched detailed extraction failed: %s", exc)
+
+    allowed_labels = set(gliner_labels)
+    results: list[dict] = []
+    for text, freetext in zip(texts, freetext_by_text):
+        structured = extract_structured_entities(text, allowed_labels)
         entities = structured + freetext
         for entity in entities:
             entity["flags"] = list(entity_flags.get(entity.get("label"), []))

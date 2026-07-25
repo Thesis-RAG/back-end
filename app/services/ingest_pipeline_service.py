@@ -198,7 +198,7 @@ class IngestPipelineService:
             chunks = chunker_service.chunk(parsed, config=chunking_cfg, doc_sensitivity=doc.sensitivity)
 
             from app.services.entity_extractor import (
-                adjust_chunk_sensitivity,
+                compute_chunk_sensitivity,
                 extract_realtime_batch_detailed,
             )
             chunk_details = extract_realtime_batch_detailed(
@@ -208,33 +208,46 @@ class IngestPipelineService:
             )
             for chunk_dict, detail in zip(chunks, chunk_details):
                 metadata_json = chunk_dict.setdefault("metadata_json", {})
-                original_chunk_sensitivity = metadata_json.get(
-                    "chunk_sensitivity", doc.sensitivity
-                )
-                adjusted_chunk_sensitivity = adjust_chunk_sensitivity(
-                    doc.sensitivity,
-                    original_chunk_sensitivity,
-                    detail.get("entities") or [],
-                    detail.get("flags") or set(),
-                )
-                metadata_json["entity_types"] = sorted({
+                entity_types = sorted({
                     str(value) for value in (detail.get("entity_types") or [])
                 } & set(confirmed_labels))
+                # Frozen snapshot of each detected type's (action, sensitivity)
+                # at ingest time — the sole input `_resync_chunk_sensitivity`
+                # later re-reads to recompute chunk_sensitivity without
+                # re-running entity detection.
+                entity_snapshot = {
+                    label: {
+                        "action": configured_by_type[label].action,
+                        "sensitivity": int(configured_by_type[label].sensitivity or 1),
+                    }
+                    for label in entity_types
+                    if label in configured_by_type
+                }
+                metadata_json["entity_types"] = entity_types
                 metadata_json["detected_entities"] = detail.get("entities") or []
                 metadata_json["sensitivity_flags"] = sorted(detail.get("flags") or [])
                 metadata_json["confirmed_labels"] = confirmed_labels
                 metadata_json["label_set_version"] = version.policy_version
                 metadata_json["entity_actions"] = {
-                    label: configured_by_type[label].action
-                    for label in metadata_json["entity_types"]
-                    if label in configured_by_type
+                    label: info["action"] for label, info in entity_snapshot.items()
                 }
-                # Preserve the old chunker/LLM result separately so changing
-                # the document level later can reproduce this decision.
-                metadata_json["llm_chunk_sensitivity"] = max(
-                    1, min(5, int(original_chunk_sensitivity))
+                metadata_json["entity_policy_snapshot"] = entity_snapshot
+                metadata_json["chunk_sensitivity"] = compute_chunk_sensitivity(
+                    doc.sensitivity, entity_snapshot
                 )
-                metadata_json["chunk_sensitivity"] = adjusted_chunk_sensitivity
+
+            # Ontology graph: record which entity types actually showed up in
+            # a document of this type — best-effort, never blocks ingest.
+            all_detected_types = {
+                t for chunk_dict in chunks
+                for t in (chunk_dict.get("metadata_json") or {}).get("entity_types") or []
+            }
+            if all_detected_types:
+                from app.services.ontology_sync_service import ontology_sync_service
+                from app.services.policy_rule_service import policy_rule_service as _policy_rule_service
+
+                for rule in _policy_rule_service.rules_by_key(db, all_detected_types).values():
+                    ontology_sync_service.sync_document_entity(doc.document_type, rule.id)
 
             chunk_models: list[DocumentChunk] = []
             for c in chunks:
@@ -294,7 +307,6 @@ class IngestPipelineService:
                     "position_ratio":      meta_json.get("position_ratio", 0.0),
                     "chunker_mode":        meta_json.get("chunker_mode", "legacy"),
                     "chunk_sensitivity":     meta_json.get("chunk_sensitivity", doc.sensitivity),
-                    "llm_chunk_sensitivity": meta_json.get("llm_chunk_sensitivity", doc.sensitivity),
                     "entity_types": ",".join(meta_json.get("entity_types") or []),
                     "confirmed_labels": ",".join(meta_json.get("confirmed_labels") or []),
                     "label_set_version": meta_json.get("label_set_version", version.policy_version),

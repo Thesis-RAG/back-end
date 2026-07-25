@@ -1,4 +1,4 @@
-from sqlalchemy import Column, JSON, String
+from sqlalchemy import Column, JSON, String, Text
 
 from app.db.base import Base, TimestampMixin
 from app.utils.ids import new_uuid
@@ -15,7 +15,7 @@ class Trace(Base, TimestampMixin):
     user_input = Column(String(4000), nullable=True)
     assistant_output_summary = Column(String(4000), nullable=True)
     retrieved_sources = Column(JSON, nullable=True)
-    llm_prompt = Column(String(4000), nullable=True)
+    llm_prompt = Column(Text, nullable=True)
     llm_response = Column(JSON, nullable=True)
     timings = Column(JSON, nullable=True)
     token_usage = Column(JSON, nullable=True)
