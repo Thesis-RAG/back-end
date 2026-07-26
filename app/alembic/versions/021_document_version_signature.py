@@ -20,22 +20,22 @@ depends_on = None
 
 
 def upgrade() -> None:
-    op.add_column(
-        "document_versions",
-        sa.Column("content_hash", sa.String(128), nullable=True),
+    # This migration was partially applied in production before Alembic
+    # could advance its version row. Keep it restart-safe so an interrupted
+    # deploy can finish rather than failing on duplicate columns.
+    existing = {column["name"] for column in sa.inspect(op.get_bind()).get_columns("document_versions")}
+    columns = (
+        ("content_hash", sa.String(128)),
+        ("content_signature", sa.Text()),
+        ("content_signature_key_id", sa.String(64)),
+        ("content_signed_at", sa.DateTime()),
     )
-    op.add_column(
-        "document_versions",
-        sa.Column("content_signature", sa.Text(), nullable=True),
-    )
-    op.add_column(
-        "document_versions",
-        sa.Column("content_signature_key_id", sa.String(64), nullable=True),
-    )
-    op.add_column(
-        "document_versions",
-        sa.Column("content_signed_at", sa.DateTime(), nullable=True),
-    )
+    for name, column_type in columns:
+        if name not in existing:
+            op.add_column(
+                "document_versions",
+                sa.Column(name, column_type, nullable=True),
+            )
 
 
 def downgrade() -> None:
