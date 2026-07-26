@@ -26,7 +26,7 @@ import sqlalchemy as sa
 
 
 revision = "016_allow_mask_scope"
-down_revision = "015_message_entity_access_requests"
+down_revision = "015_message_entity_access_req"
 branch_labels = None
 depends_on = None
 

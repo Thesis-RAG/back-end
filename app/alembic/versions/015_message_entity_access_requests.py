@@ -5,7 +5,7 @@ from alembic import op
 import sqlalchemy as sa
 
 
-revision = "015_message_entity_access_requests"
+revision = "015_message_entity_access_req"
 down_revision = "014_entity_policy_tiered_scope"
 branch_labels = None
 depends_on = None
