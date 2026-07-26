@@ -17,6 +17,10 @@ class Message(Base, TimestampMixin):
     # Stored with the message so historical conversations remain explainable
     # even after rules are edited or removed.
     applied_rules_json = Column(JSON, nullable=True)
+    # [{chunk_id, entity_type}] for every "require" entity masked in this
+    # message's content — lets reveal_for_message() recompute the original
+    # value on demand without ever persisting it back into `content`.
+    entity_masks_json = Column(JSON, nullable=True)
     parent_message_id = Column(String(36), nullable=True)
     client_message_id = Column(String(36), nullable=True, index=True)
     status = Column(String(36), nullable=True, index=True)

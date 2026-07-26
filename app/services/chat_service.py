@@ -36,16 +36,65 @@ from app.services.retrieval_service import retrieval_service
 from app.utils.markdown_tables import normalize_markdown_tables
 from app.utils.status_answer import is_no_answer
 
-# Keep input prompt-injection detection enabled. PII masking is intentionally
-# not performed by a guard; policy rules are the single source of truth for
-# hiding retrieved fields and answer content.
-PROMPT_GUARD_ENABLED = True
+# Guard 1 (query intent classification: block/rewrite) — temporarily off,
+# re-enable by flipping back to True + restart.
+PROMPT_GUARD_ENABLED = False
+# Guard 2 (prompt-injection normalize/annotate/wrap) — temporarily off,
+# re-enable by flipping back to True + restart.
+PROMPT_INJECTION_GUARD_ENABLED = False
+prompt_injection_guard.enabled = PROMPT_INJECTION_GUARD_ENABLED
 # Toggle per-entity enforcement at the retrieval boundary.
 POLICY_ENABLED = True
+# Second LLM call inside _filter_final_answer() that reviews/trims the
+# already-generated answer — temporarily off, re-enable by flipping back to
+# True + restart. The deterministic (non-LLM) pass in _filter_final_answer
+# always still runs regardless of this flag.
+FINAL_ANSWER_LLM_FILTER_ENABLED = False
 # Terminal assistant message statuses considered complete for listing.
 DONE_STATUSES = {"success", "fallback", "no_answer", "llm_error", "blocked"}
 
 logger = logging.getLogger(__name__)
+
+_TIER_LABEL = {"full": "allow", "require": "mask", "block": "block"}
+# Maps policy_rule_service.resolve_tier()'s tier names to the wire-level
+# EntityAction values the frontend badge renderer switches on ("full" here
+# means "not masked/blocked", not "the whole document").
+_TIER_TO_ACTION = {"full": "full", "require": "mask", "block": "block"}
+
+
+# Print the post-RRF retrieved chunks with the entity/action decisions applied
+# to each one, so the resolved policy outcome is visible in the terminal
+# without having to inspect the DB/trace.
+def _log_retrieved_chunks(tid: str, retrieved: list[dict], policy_contracts: list[dict]) -> None:
+    print(f"[RETRIEVED-CHUNKS] trace_id={tid} total={len(retrieved)}")
+    contracts_by_chunk = {c.get("chunk_id"): c for c in policy_contracts}
+    for i, chunk in enumerate(retrieved, start=1):
+        md = chunk.get("metadata") or {}
+        chunk_id = chunk.get("chunk_id")
+        title = md.get("document_title") or md.get("document_id") or "?"
+        section = md.get("section_heading")
+        score = chunk.get("score")
+        contract = contracts_by_chunk.get(chunk_id) or {}
+        entities = contract.get("matched_entities") or []
+        entity_str = ", ".join(
+            f"{e.get('entity_type')}={_TIER_LABEL.get(e.get('tier'), e.get('tier'))}"
+            for e in entities
+        ) or "(none)"
+        print(
+            f"  [{i}] chunk_id={chunk_id} score={score} doc={title!r} "
+            f"section={section!r} decision={contract.get('decision')} entities: {entity_str}"
+        )
+
+
+# Print the exact prompt string handed to the LLM for this generation call.
+def _log_final_prompt(tid: str, prompt: str) -> None:
+    print(f"[FINAL-PROMPT] trace_id={tid} chars={len(prompt)}\n{prompt}\n[/FINAL-PROMPT]")
+
+
+# Print the raw LLM answer, before any policy/citation filtering is applied.
+def _log_llm_response(tid: str, text: str | None) -> None:
+    text = text or ""
+    print(f"[LLM-RESPONSE] trace_id={tid} chars={len(text)}\n{text}\n[/LLM-RESPONSE]")
 
 
 def _safe_stream_fragment(buffer: str, fragment: str, *, final: bool = False) -> tuple[str, list[str]]:
@@ -315,6 +364,18 @@ class ChatService:
             logger.warning("Query contextualization failed, using original query", exc_info=True)
             return query
 
+    # Build the {chunk_id, entity_type} pointer list needed to recompute a
+    # 'require' entity's real value later, for exactly this message.
+    def _build_entity_masks(self, policy_contracts: list[dict]) -> list[dict]:
+        masks: list[dict] = []
+        for contract in policy_contracts or []:
+            chunk_id = contract.get("chunk_id")
+            if not chunk_id:
+                continue
+            for entity_type in contract.get("require_entity_types") or []:
+                masks.append({"chunk_id": chunk_id, "entity_type": entity_type})
+        return masks
+
     # Persist source attribution records for an assistant message.
     def _persist_sources(self, db: Session, assistant_message_id: str, sources: list[dict]) -> None:
         for s in sources or []:
@@ -360,6 +421,7 @@ class ChatService:
             "entityAccessRequired": r.get("entity_access_required", False),
             "entityAccessGranted": r.get("entity_access_granted", False),
             "blockedEntityTypes": r.get("blocked_entity_types") or (md.get("blocked_entity_types") or []),
+            "requireEntityTypes": r.get("require_entity_types") or (md.get("require_entity_types") or []),
         }
 
     # Renumber [N] citation markers to be sequential (1-based) and return matched sources.
@@ -504,11 +566,7 @@ class ChatService:
         # Entity actions are evaluated after retrieval and before prompt construction.
         policy_contracts: list[dict] = []
         has_watermark = False
-        if (
-            POLICY_ENABLED
-            and retrieved
-            and not entity_policy_service.bypasses_entity_actions(user)
-        ):
+        if POLICY_ENABLED and retrieved:
             retrieved, policy_contracts = entity_policy_service.apply_to_retrieved(
                 db, user, effective_query, retrieved
             )
@@ -516,8 +574,14 @@ class ChatService:
                 f"[ENTITY-POLICY] processed={len(retrieved)}/{len(retrieved_raw)} "
                 f"blocked={sum(1 for c in policy_contracts if c.get('decision') == 'block')}"
             )
+        _log_retrieved_chunks(tid, retrieved, policy_contracts)
 
         # Keep the legacy wire field name while exposing entity actions, not rules.
+        # matched_entities items only ever carry {"entity_type", "tier"} (see
+        # entity_policy_service.apply_to_retrieved) — there is no "action" key,
+        # so entity.get("action", "full") always silently fell through to the
+        # "full" default regardless of the real tier, making every badge in
+        # the chat UI show "full" even for blocked/masked entities.
         seen_rule_codes: set[str] = set()
         applied_rules: list[dict] = []
         for contract in policy_contracts:
@@ -529,8 +593,8 @@ class ChatService:
                 seen_rule_codes.add(code)
                 applied_rules.append({
                     "rule_code": code,
-                    "name": entity_type,
-                    "action": entity.get("action", "full"),
+                    "name": entity.get("display_name") or entity_type,
+                    "action": _TIER_TO_ACTION.get(entity.get("tier"), "block"),
                     "domain": "document",
                     "entity_type": entity_type,
                 })
@@ -544,14 +608,13 @@ class ChatService:
             for contract in policy_contracts
         ]
 
-        has_restricted = bool(retrieved and any(
-            c.get("entity_access_required") is True for c in retrieved
-        )) or bool(
+        # Only require/mask-tier content is appeal-eligible (see
+        # entity_policy_service.apply_to_retrieved) — block-tier entities are
+        # masked in-place and never suppress the chunk itself, so there is no
+        # "all chunks fully restricted" short-circuit anymore.
+        has_restricted = bool(
             policy_contracts and any(c.get("requires_access_request") for c in policy_contracts)
         )
-        all_restricted = bool(retrieved and all(
-            c.get("entity_access_required") for c in retrieved
-        ))
 
         history = self._load_history(db, conversation_id, effective_query)
         safe_history: list = [] if has_restricted else history
@@ -564,7 +627,6 @@ class ChatService:
             "applied_rules":    applied_rules,
             "has_watermark":    has_watermark,
             "has_restricted":   has_restricted,
-            "all_restricted":   all_restricted,
             "safe_history":     safe_history,
         }
 
@@ -578,7 +640,7 @@ class ChatService:
         if not text:
             return ""
         cleaned: list[str] = []
-        for line in sanitize_masked_markers(text, drop_masked_lines=True).splitlines():
+        for line in text.splitlines():
             if cls._has_hidden_output(line):
                 continue
             cleaned.append(line.rstrip())
@@ -611,12 +673,11 @@ class ChatService:
                 continue
             if source.get("docRestricted") and not source.get("entityAccessRequired"):
                 continue
-            source_text = " ".join(
-                str(source.get(key) or "")
-                for key in ("documentTitle", "sectionPath", "excerpt", "surroundingContext")
-            )
-            if cls._has_hidden_output(source_text):
-                continue
+            # Strip only the hidden lines (eg. an unrelated blocked field in
+            # the same chunk) rather than dropping the whole citation — a
+            # chunk can legitimately contain both an answered, allowed field
+            # and a masked one; the mask marker there is intended display,
+            # not a leak, so it must not disqualify the citation.
             cleaned_source = dict(source)
             for key in ("documentTitle", "sectionPath", "excerpt", "surroundingContext"):
                 cleaned_source[key] = cls._drop_hidden_output_lines(cleaned_source.get(key))
@@ -651,7 +712,7 @@ class ChatService:
         if not safe_answer:
             return "Không có thông tin có thể hiển thị theo chính sách.", []
 
-        if not llm_service.is_configured():
+        if not llm_service.is_configured() or not FINAL_ANSWER_LLM_FILTER_ENABLED:
             return safe_answer, safe_sources
 
         citation_blocks = []
@@ -710,7 +771,7 @@ class ChatService:
     # ------------------------------------------------------------------
 
     # Return all user/assistant message pairs for a conversation as a flat list.
-    def list_messages_flat(self, db: Session, conversation_id: str, limit: int = 1000) -> list[dict]:
+    def list_messages_flat(self, db: Session, conversation_id: str, limit: int = 1000, user=None) -> list[dict]:
         from app.models.message import Message as MsgModel
 
         user_msgs = (
@@ -747,6 +808,17 @@ class ChatService:
             assistant_msg = assistant_by_parent.get(user_msg.id)
             srcs = self.msg_sources.list_by_message(db, assistant_msg.id) if assistant_msg else []
 
+            # Reveal 'require' entities the user was approved to see IN THIS
+            # message — computed per-response, never written back to DB.
+            assistant_content = assistant_msg.content if assistant_msg else None
+            pending_require_types: list[str] = []
+            if assistant_msg and user is not None and assistant_msg.entity_masks_json:
+                assistant_content = entity_policy_service.reveal_for_message(db, user, assistant_msg)
+                from app.repositories.message_entity_repository import message_entity_repository
+                granted = message_entity_repository.granted_types(db, str(user.id), assistant_msg.id)
+                all_types = {mask.get("entity_type") for mask in assistant_msg.entity_masks_json if mask.get("entity_type")}
+                pending_require_types = sorted(all_types - granted)
+
             out.append({
                 "conversationId": conversation_id,
                 "messageId": user_msg.id,
@@ -756,10 +828,11 @@ class ChatService:
                 "traceId": (assistant_msg.trace_id if assistant_msg else None) or user_msg.trace_id,
                 "assistantMessage": {
                     "id": assistant_msg.id,
-                    "content": assistant_msg.content,
+                    "content": assistant_content,
                     "status": assistant_msg.status,
                     "createdAt": assistant_msg.created_at,
                     "appliedRules": assistant_msg.applied_rules_json or [],
+                    "requireEntityTypes": pending_require_types,
                 } if assistant_msg else None,
                 "appliedRules": (assistant_msg.applied_rules_json or []) if assistant_msg else [],
                 "sources": [
@@ -841,7 +914,6 @@ class ChatService:
         retrieved_raw    = ctx["retrieved_raw"]
         policy_contracts = ctx["policy_contracts"]
         has_watermark    = ctx["has_watermark"]
-        all_restricted   = ctx["all_restricted"]
         safe_history     = ctx["safe_history"]
         applied_rules    = ctx.get("applied_rules", [])
         policy_summary   = ctx.get("policy_summary", [])
@@ -853,13 +925,7 @@ class ChatService:
         assistant_status = "fallback"
         llm_text: str | None = None
 
-        # All chunks were REDACT'd — respond directly without calling the LLM.
-        if all_restricted:
-            answer_text = "Thông tin này bị hạn chế theo chính sách phân quyền của hệ thống và không thể hiển thị."
-            sources = [self._make_source_entry(chunk) for chunk in retrieved]
-            assistant_status = "success"
-
-        elif llm_service.is_configured():
+        if llm_service.is_configured():
             try:
                 _has_transform = bool(policy_contracts and any(
                     c.get("decision") in ("ANONYMIZE", "GENERALIZE", "SUMMARIZE")
@@ -882,9 +948,11 @@ class ChatService:
                     chat_history=safe_history,
                     extra_instructions=_extra_instructions,
                 )
+                _log_final_prompt(tid, prompt)
                 llm_text, llm_raw, _ = llm_service.generate(
                     prompt=prompt, max_tokens=512, temperature=0.0,
                 )
+                _log_llm_response(tid, llm_text)
                 if llm_text and llm_text.strip():
                     answer_text = llm_text.strip()
                 assistant_status = "no_answer" if is_no_answer(answer_text) else "success"
@@ -926,6 +994,7 @@ class ChatService:
             trace_id=tid,
             parent_message_id=user_msg.id,
             applied_rules_json=applied_rules,
+            entity_masks_json=self._build_entity_masks(policy_contracts),
         )
         self.msgs.create(db, assistant_msg)
         db.flush()
@@ -1087,6 +1156,7 @@ class ChatService:
         sources              = []
         retrieved_raw:  list[dict] = []
         stream_applied_rules: list[dict] = []
+        stream_policy_contracts: list[dict] = []
         stream_policy_summary: list[dict] = []
         stream_has_watermark = False
 
@@ -1117,6 +1187,7 @@ class ChatService:
                         full_text += token
 
                     full_text = re.sub(r"<think>.*?</think>", "", full_text, flags=re.DOTALL).strip()
+                    _log_llm_response(tid, full_text)
 
                 except Exception:
                     logger.exception("Chatbot stream failed")
@@ -1138,7 +1209,6 @@ class ChatService:
             stream_applied_rules    = ctx.get("applied_rules", [])
             stream_policy_summary   = ctx.get("policy_summary", [])
             stream_has_watermark    = ctx["has_watermark"]
-            stream_all_restricted   = ctx["all_restricted"]
             safe_history            = ctx["safe_history"]
 
             if stream_applied_rules:
@@ -1147,9 +1217,6 @@ class ChatService:
 
             if not retrieved:
                 full_text = "Xin lỗi, không tìm thấy thông tin liên quan. Vui lòng thử diễn đạt lại câu hỏi."
-
-            elif stream_all_restricted:
-                full_text = "Thông tin này bị hạn chế theo chính sách phân quyền của hệ thống và không thể hiển thị."
 
             elif llm_service.is_configured():
                 try:
@@ -1171,13 +1238,14 @@ class ChatService:
                         chat_history=safe_history,
                         extra_instructions=_stream_extra,
                     )
-                    logger.info("LLM stream prompt trace_id=%s", tid)
+                    _log_final_prompt(tid, prompt)
 
                     for token in llm_service.generate_stream(prompt=prompt, max_tokens=2048):
                         full_text += token
 
                     full_text = re.sub(r"<think>.*?</think>", "", full_text, flags=re.DOTALL).strip()
                     logger.info("LLM stream result len=%d", len(full_text))
+                    _log_llm_response(tid, full_text)
 
                 except Exception:
                     logger.exception("LLM stream failed")
@@ -1214,6 +1282,7 @@ class ChatService:
         assistant_msg.content = full_text
         assistant_msg.status  = "success"
         assistant_msg.applied_rules_json = stream_applied_rules
+        assistant_msg.entity_masks_json = self._build_entity_masks(stream_policy_contracts)
         self._persist_sources(db, assistant_msg.id, sources)
         tr.assistant_output_summary = full_text[:2000] if full_text else None
         tr.retrieved_sources = [] if mode == "chatbot" else retrieved_raw
@@ -1236,7 +1305,11 @@ class ChatService:
             daemon=True,
         ).start()
 
-        yield {"type": "done", "content": full_text, "sources": sources, "messageId": assistant_msg.id, "applied_rules": stream_applied_rules}
+        _require_types = sorted({t for s in (sources or []) for t in (s.get("requireEntityTypes") or [])})
+        yield {
+            "type": "done", "content": full_text, "sources": sources, "messageId": assistant_msg.id,
+            "applied_rules": stream_applied_rules, "requireEntityTypes": _require_types,
+        }
 
 # Module-level singleton; imported by the chat API router.
 chat_service = ChatService()

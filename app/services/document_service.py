@@ -29,7 +29,7 @@ from app.repositories.version_repository import VersionRepository
 from app.schemas.document import ChunkingConfig, DocumentCreateRequest, DocumentUpdateRequest
 from app.services.audit_service import audit_service
 from app.services.chroma_service import chroma_service
-from app.services.entity_extractor import adjust_chunk_sensitivity
+from app.services.entity_extractor import compute_chunk_sensitivity
 from app.services.job_service import job_service
 from app.services.oui_tree_service import oui_tree_service
 from app.services.sensitivity_levels import MIN_SENSITIVITY
@@ -104,6 +104,7 @@ class DocumentService:
                 entity_type=rule["entity_key"],
                 label=rule.get("display_name") or rule["entity_key"],
                 action=rule.get("action") or "full",
+                sensitivity=int(rule.get("sensitivity") or 1),
                 source=rule.get("detection_source") or "manual",
                 enabled=True,
                 sort_order=sort_order,
@@ -265,9 +266,9 @@ class DocumentService:
         return doc
 
     # Re-compute chunk_sensitivity for all chunks after a doc sensitivity change.
-    # Uses the old chunker/LLM sensitivity plus the persisted GLiNER entities.
-    # Raises stay intact; reductions require the same strict common-public-
-    # entity check used during ingest.
+    # Re-reads each chunk's frozen entity_policy_snapshot (captured at ingest
+    # time) and re-applies compute_chunk_sensitivity — never re-detects
+    # entities, and ignores any later edits to the global policy rules.
     def _resync_chunk_sensitivity(
         self, db: Session, doc: Document, new_sensitivity: int, old_sensitivity: int
     ) -> None:
@@ -286,50 +287,21 @@ class DocumentService:
         if not chunks:
             return
 
-        chunk_ids = [c.id for c in chunks]
-        chunk_by_id = {c.id: c for c in chunks}
-
-        try:
-            chroma_metas = chroma_service.get_metadatas_by_ids(chunk_ids)
-        except Exception as exc:
-            logger.warning("Could not fetch Chroma metadata for doc %s: %s", doc.id, exc)
-            chroma_metas = {}
-
-        groups: dict[tuple[int, int], list[str]] = defaultdict(list)
-        for cid in chunk_ids:
-            chroma_meta = chroma_metas.get(cid, {})
-            llm_cs = chroma_meta.get("llm_chunk_sensitivity")
-            chunk = chunk_by_id[cid]
+        groups: dict[int, list[str]] = defaultdict(list)
+        for chunk in chunks:
             meta = dict(chunk.metadata_json or {})
-            if llm_cs is None:
-                # Fallback for chunks ingested before llm_chunk_sensitivity
-                # was stored: the old chunk metadata is the best available base.
-                llm_cs = meta.get("llm_chunk_sensitivity", old_sensitivity)
-            try:
-                # Rebase the old chunker's relative delta to the new document
-                # level before applying the GLiNER safety rule.
-                rebased_llm_cs = int(new_sensitivity) + (int(llm_cs) - int(old_sensitivity))
-            except (TypeError, ValueError):
-                rebased_llm_cs = new_sensitivity
-            rebased_llm_cs = max(1, min(5, rebased_llm_cs))
-            new_cs = adjust_chunk_sensitivity(
-                new_sensitivity,
-                rebased_llm_cs,
-                meta.get("detected_entities") or [],
-                meta.get("sensitivity_flags") or set(),
-            )
-            groups[(new_cs, rebased_llm_cs)].append(cid)
+            entity_snapshot = meta.get("entity_policy_snapshot") or {}
+            new_cs = compute_chunk_sensitivity(new_sensitivity, entity_snapshot)
             meta["chunk_sensitivity"] = new_cs
-            meta["llm_chunk_sensitivity"] = rebased_llm_cs
             chunk.metadata_json = meta
+            groups[new_cs].append(chunk.id)
 
-        for (cs_val, llm_cs), cids in groups.items():
+        for cs_val, cids in groups.items():
             try:
                 chroma_service.update_document_metadata(
                     cids,
                     {
                         "chunk_sensitivity": cs_val,
-                        "llm_chunk_sensitivity": llm_cs,
                         "sensitivity": new_sensitivity,
                     },
                 )

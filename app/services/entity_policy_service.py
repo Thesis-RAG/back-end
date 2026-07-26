@@ -14,13 +14,11 @@ from app.models.document_version import DocumentVersion
 from app.repositories.document_entity_repository import document_entity_repository
 from app.services.entity_extractor import extract_realtime_batch_detailed, run_pipeline
 from app.services.parser_service import parser_service
-from app.services.policy_rule_service import DEFAULT_POLICY_PROFILE, policy_rule_service
+from app.services.policy_rule_service import DEFAULT_POLICY_PROFILE, policy_rule_service, resolve_tier
 from app.services.user_service import user_service
 
 
 VALID_ACTIONS = {"block", "full", "mask"}
-# Clearance 4 (Mật) and 5 (Tuyệt mật) can inspect entity values directly.
-ENTITY_POLICY_BYPASS_CLEARANCE = 4
 _SEMANTIC_ALIASES = {
     "salary": {"salary", "income", "wage", "pay", "lương", "thu nhập", "tiền công"},
     "person_name": {"name", "employee", "person", "tên", "nhân viên", "người"},
@@ -71,13 +69,35 @@ def normalize_actions(actions: Iterable[dict]) -> list[dict]:
     return result
 
 
-def _replace_entity_spans(text: str, entities: list[dict], replacements: dict[str, str]) -> str:
+# Mask part of a value's text, keeping the rest visible for context/verification.
+# position="head" masks the start (keeps the tail visible), "tail" masks the
+# end (keeps the head visible), "center" keeps both ends and masks the middle.
+def _partial_mask(text: str, position: str | None) -> str:
+    text = text or ""
+    n = len(text)
+    if n <= 2:
+        return "*" * n
+    keep = max(1, n // 4)
+    if position == "head":
+        return "*" * (n - keep) + text[-keep:]
+    if position == "center":
+        half = max(1, keep // 2)
+        return text[:half] + "*" * (n - 2 * half) + text[-half:]
+    # default: tail
+    return text[:keep] + "*" * (n - keep)
+
+
+def _replace_entity_spans(
+    text: str, entities: list[dict], replacements: dict[str, "str | callable"]
+) -> str:
     edits: list[tuple[int, int, str]] = []
     for entity in entities:
         label = normalize_entity_type(entity.get("label", ""))
         replacement = replacements.get(label)
         if replacement is None:
             continue
+        if callable(replacement):
+            replacement = replacement(entity)
         try:
             start, end = int(entity.get("start", 0)), int(entity.get("end", 0))
         except (TypeError, ValueError):
@@ -100,36 +120,58 @@ class EntityPolicyService:
         """Resolve the active global policy for a new document version."""
         return policy_rule_service.snapshot(db, DEFAULT_POLICY_PROFILE)
 
-    @staticmethod
-    def max_user_clearance(user) -> int:
-        """Return the highest clearance available on either user shape."""
-        if user is None:
-            return 1
+    # Recompute a 'require' entity's real value for display, scoped to this
+    # exact message and this exact user — never written back into
+    # Message.content, never reused by any other message or user.
+    def reveal_for_message(self, db: Session, user, message) -> str:
+        content = message.content or ""
+        masks = message.entity_masks_json or []
+        if not masks:
+            return content
 
-        max_clearance = 1
-        try:
-            max_clearance = max(max_clearance, int(getattr(user, "max_clearance", 1) or 1))
-        except (TypeError, ValueError):
-            pass
+        from app.repositories.message_entity_repository import message_entity_repository
+        granted = message_entity_repository.granted_types(db, str(user.id), message.id)
+        if not granted:
+            return content
 
-        # API dependencies provide the SQLAlchemy User model, while some
-        # internal callers/tests provide the serialized user response. Support
-        # both shapes so the policy bypass cannot depend on representation.
-        for position_holder in getattr(user, "oui_positions", []) or []:
-            position = getattr(position_holder, "position", position_holder)
-            try:
-                max_clearance = max(
-                    max_clearance,
-                    int(getattr(position, "clearance", 1) or 1),
-                )
-            except (TypeError, ValueError):
+        from app.models.document_chunk import DocumentChunk
+        chunk_ids = {
+            mask.get("chunk_id") for mask in masks
+            if normalize_entity_type(mask.get("entity_type") or "") in granted and mask.get("chunk_id")
+        }
+        if not chunk_ids:
+            return content
+        chunks = db.query(DocumentChunk).filter(DocumentChunk.id.in_(chunk_ids)).all()
+        if not chunks:
+            return content
+        details = extract_realtime_batch_detailed([c.chunk_text or "" for c in chunks], db=db)
+
+        revealed = content
+        for chunk, detail in zip(chunks, details):
+            wanted_types = {
+                normalize_entity_type(mask.get("entity_type") or "")
+                for mask in masks
+                if mask.get("chunk_id") == chunk.id
+                and normalize_entity_type(mask.get("entity_type") or "") in granted
+            }
+            if not wanted_types:
                 continue
-        return max_clearance
-
-    @classmethod
-    def bypasses_entity_actions(cls, user) -> bool:
-        """High-clearance users do not receive entity-rule transformations."""
-        return cls.max_user_clearance(user) >= ENTITY_POLICY_BYPASS_CLEARANCE
+            rules = policy_rule_service.rules_by_key(db, wanted_types)
+            for entity in detail.get("entities") or []:
+                label = normalize_entity_type(entity.get("label") or "")
+                if label not in wanted_types:
+                    continue
+                real_text = str(entity.get("text") or "")
+                if not real_text:
+                    continue
+                rule = rules.get(label)
+                if rule and rule.mask_style == "partial":
+                    masked_repr = _partial_mask(real_text, rule.mask_position)
+                else:
+                    masked_repr = f"[Đã che thực thể '{label}']"
+                if masked_repr in revealed:
+                    revealed = revealed.replace(masked_repr, real_text)
+        return revealed
 
     @staticmethod
     def action_applies_to_user(action: DocumentEntityAction, user) -> bool:
@@ -257,18 +299,44 @@ class EntityPolicyService:
         invalidate_label_cache()
         return rows
 
+    # Full normalized text for a version, used only for the raw-file gate's
+    # live detection — never cached, always re-read at call time.
+    def _version_full_text(self, db: Session, version: DocumentVersion) -> str:
+        if not version.normalized_object:
+            return ""
+        from app.services.storage_service import storage_service
+        try:
+            raw = storage_service.download(
+                version.normalized_object.bucket, version.normalized_object.object_key
+            )
+            return raw.decode("utf-8", errors="ignore")
+        except Exception:
+            return ""
+
+    # Entity types that gate the RAW file (whole-document, not per-span):
+    # detected live against the current central policy, every call — a
+    # label added after this document was ingested applies immediately,
+    # with no reprocessing step required.
     def blocked_types_for_version(self, db: Session, version_id: str, user=None) -> set[str]:
-        actions = document_entity_repository.list_actions(db, version_id)
+        if user is None:
+            return set()
         version = db.get(DocumentVersion, version_id)
-        detected = set((version.entity_detection_json or {}).get("entity_types") or []) if version else set()
-        blocked = {
-            normalize_entity_type(row.entity_type)
-            for row in actions
-            if row.enabled
-            and row.action == "block"
-            and (user is None or self.action_applies_to_user(row, user))
+        if not version:
+            return set()
+        text = self._version_full_text(db, version)
+        if not text:
+            return set()
+        detail = extract_realtime_batch_detailed([text], db=db)
+        if not detail:
+            return set()
+        detected_types = {normalize_entity_type(value) for value in detail[0].get("entity_types") or []}
+        if not detected_types:
+            return set()
+        rules = policy_rule_service.rules_by_key(db, detected_types)
+        return {
+            label for label in detected_types
+            if label in rules and resolve_tier(rules[label], user)["tier"] == "block"
         }
-        return blocked.intersection({normalize_entity_type(value) for value in detected})
 
     def has_entity_access(self, db: Session, user, document_id: str, version_id: str, entity_types: set[str]) -> bool:
         if not entity_types:
@@ -286,33 +354,14 @@ class EntityPolicyService:
     def apply_to_retrieved(self, db: Session, user, query: str, chunks: list[dict]) -> tuple[list[dict], list[dict]]:
         if not chunks:
             return [], []
-        if self.bypasses_entity_actions(user):
-            return chunks, []
 
         query_entities = self.query_entities(query, db)
-        # Use each chunk's snapshotted label set. This prevents a later global
-        # rule edit from changing how an older document is interpreted.
-        details: list[dict] = []
-        for chunk in chunks:
-            metadata = chunk.get("metadata") or {}
-            raw_labels = metadata.get("confirmed_labels")
-            if isinstance(raw_labels, str):
-                snapshot_labels = [value for value in raw_labels.split(",") if value]
-            elif isinstance(raw_labels, (list, tuple, set)):
-                snapshot_labels = [str(value) for value in raw_labels]
-            else:
-                snapshot_labels = None
-            details.extend(extract_realtime_batch_detailed(
-                [str(chunk.get("document_text") or "")],
-                db=db,
-                labels=snapshot_labels,
-            ))
-        version_ids = [
-            str((chunk.get("metadata") or {}).get("document_version_id"))
-            for chunk in chunks
-            if (chunk.get("metadata") or {}).get("document_version_id")
-        ]
-        action_map = document_entity_repository.get_action_map(db, version_ids)
+        # Always detect against the LIVE central policy label set (no frozen
+        # per-chunk snapshot) — a label added today must apply to documents
+        # ingested long before it existed, without any reprocessing step.
+        details = extract_realtime_batch_detailed(
+            [str(chunk.get("document_text") or "") for chunk in chunks], db=db,
+        )
         processed: list[dict] = []
         contracts: list[dict] = []
 
@@ -321,54 +370,69 @@ class EntityPolicyService:
             metadata = dict(chunk.get("metadata") or {})
             document_id = str(metadata.get("document_id") or "")
             version_id = str(metadata.get("document_version_id") or "")
-            actions = {
-                normalize_entity_type(row.entity_type): row
-                for row in action_map.get(version_id, [])
-                if row.enabled and self.action_applies_to_user(row, user)
-            }
+            chunk_id = str(chunk.get("chunk_id") or "")
             entities = detail.get("entities") or []
             detected_types = {normalize_entity_type(value) for value in detail.get("entity_types") or []}
-            blocked_types = {
-                label for label, row in actions.items()
-                if row.action == "block" and label in detected_types
-            }
-            masked_types = {
-                label for label, row in actions.items()
-                if row.action == "mask" and label in detected_types
-            }
-            approved = self.has_entity_access(db, user, document_id, version_id, blocked_types)
-            hidden_blocked_types = set() if approved else blocked_types
 
-            replacements: dict[str, str] = {
-                label: f"[Nội dung thực thể '{label}' cần quyền xem]"
-                for label in hidden_blocked_types
+            rules = policy_rule_service.rules_by_key(db, detected_types)
+            resolved = {
+                label: resolve_tier(rules[label], user)
+                for label in detected_types
+                if label in rules
             }
-            replacements.update({
-                label: f"[Đã che thực thể '{label}']"
-                for label in masked_types
-                if label not in replacements
-            })
+            blocked_types = {label for label, res in resolved.items() if res["tier"] == "block"}
+            require_types = {label for label, res in resolved.items() if res["tier"] == "require"}
+
+            # block: always masked, no appeal path — a hard denial with
+            # nothing to request (unlike require, which stays reveal-able
+            # via the per-message flow below).
+            replacements: dict[str, object] = {
+                label: f"[Thực thể '{label}' đã bị ẩn theo chính sách]"
+                for label in blocked_types
+            }
+
+            # require: never revealed at generation time (no message_id yet
+            # to check a per-message grant against) — always masked here.
+            # Reveal happens later, per-message, when serving a persisted
+            # message via reveal_for_message().
+            for label in require_types:
+                if label in replacements:
+                    continue
+                res = resolved[label]
+                if res.get("mask_style") == "partial":
+                    position = res.get("mask_position")
+                    replacements[label] = (
+                        lambda entity, _pos=position: _partial_mask(str(entity.get("text") or ""), _pos)
+                    )
+                else:
+                    replacements[label] = f"[Đã che thực thể '{label}']"
+
             result["document_text"] = _replace_entity_spans(
                 str(chunk.get("document_text") or ""), entities, replacements
             )
             metadata.update({
-                "entity_access_required": bool(hidden_blocked_types),
-                "entity_access_granted": approved,
-                "blocked_entity_types": sorted(hidden_blocked_types),
-                "masked_entity_types": sorted(masked_types),
+                # No appeal exists for block tier anymore, so this chunk
+                # never needs the document-level access-request UI.
+                "entity_access_required": False,
+                "entity_access_granted": False,
+                "blocked_entity_types": sorted(blocked_types),
+                "require_entity_types": sorted(require_types),
                 "detected_entity_types": sorted(detected_types),
             })
             result["metadata"] = metadata
-            result["entity_access_required"] = bool(hidden_blocked_types)
-            result["entity_access_granted"] = approved
-            result["blocked_entity_types"] = sorted(hidden_blocked_types)
-            result["masked_entity_types"] = sorted(masked_types)
-            result["doc_restricted"] = bool(chunk.get("doc_restricted") or hidden_blocked_types)
+            result["entity_access_required"] = False
+            result["entity_access_granted"] = False
+            result["blocked_entity_types"] = sorted(blocked_types)
+            result["require_entity_types"] = sorted(require_types)
+            result["chunk_id"] = chunk_id
+            # Only require-tier content is appeal-eligible now; block-tier
+            # masking is permanent and shouldn't invite a request.
+            result["doc_restricted"] = bool(chunk.get("doc_restricted") or require_types)
 
-            if hidden_blocked_types:
+            if blocked_types:
                 decision = "block"
-            elif masked_types:
-                decision = "mask"
+            elif require_types:
+                decision = "require"
             else:
                 decision = "full"
 
@@ -376,15 +440,20 @@ class EntityPolicyService:
                 "contract_id": f"PC-{uuid.uuid4().hex[:12]}",
                 "document_id": document_id,
                 "document_version_id": version_id,
-                "chunk_id": chunk.get("chunk_id") or "",
+                "chunk_id": chunk_id,
                 "query_entities": sorted(query_entities),
                 "detected_entities": sorted(detected_types),
                 "matched_entities": [
-                    {"entity_type": label, "action": actions[label].action}
-                    for label in sorted(actions.keys() & detected_types)
+                    {
+                        "entity_type": label,
+                        "tier": res["tier"],
+                        "display_name": rules[label].display_name,
+                    }
+                    for label, res in sorted(resolved.items())
                 ],
                 "decision": decision,
-                "requires_access_request": bool(hidden_blocked_types),
+                "requires_access_request": bool(require_types),
+                "require_entity_types": sorted(require_types),
             }
             result["policy_contract"] = contract
             contracts.append(contract)

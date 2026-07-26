@@ -23,6 +23,7 @@ from app.api.v1.org_units import router as org_units_router
 from app.api.v1.policy import router as policy_router
 from app.api.v1.settings import router as settings_router
 from app.api.v1.document_access_requests import router as access_requests_router
+from app.api.v1.ontology_graph import router as ontology_graph_router
 from app.core.exceptions import register_exception_handlers
 from app.core.config import settings
 from app.core.logging import configure_logging
@@ -112,6 +113,44 @@ def wait_for_openfga():
     raise RuntimeError("OpenFGA did not become ready")
 
 
+# Seed the ontology graph's static taxonomy and backfill real data into it,
+# but only if it's still empty (first run) — re-seeding on every restart
+# would wipe any nodes/edges a user added directly through the graph
+# editor, since seed_ontology.main() does a full DETACH DELETE first.
+# Non-fatal: the ontology graph is a visualization layered on top of the
+# real app (see app/services/ontology_sync_service.py's module docstring),
+# not a load-bearing dependency — it must never block API startup.
+def bootstrap_ontology_graph():
+    from app.db.neo4j_client import get_driver, get_session
+
+    for attempt in range(30):
+        try:
+            get_driver().verify_connectivity()
+            break
+        except Exception:
+            logger.warning("Neo4j is not ready (attempt %d/30)", attempt + 1, exc_info=True)
+            time.sleep(2)
+    else:
+        logger.warning("Neo4j did not become ready — ontology graph will stay unseeded until the next restart")
+        return
+
+    try:
+        with get_session() as session:
+            count = session.run("MATCH (n:OntologyNode) RETURN count(n) AS c").single()["c"]
+        if count > 0:
+            logger.info("Ontology graph already has %d node(s) — skipping seed/backfill", count)
+            return
+
+        logger.info("Ontology graph is empty — seeding taxonomy and backfilling real data")
+        from app.scripts import resync_ontology, seed_ontology
+
+        seed_ontology.main()
+        with SessionLocal() as db:
+            resync_ontology.run(db)
+    except Exception:
+        logger.warning("Ontology graph bootstrap failed", exc_info=True)
+
+
 # Wait for MinIO before declaring the API ready.
 def wait_for_storage():
     for attempt in range(30):
@@ -138,6 +177,7 @@ def startup_event():
     with SessionLocal() as db:
         bootstrap_service.seed_defaults(db)
     wait_for_storage()
+    bootstrap_ontology_graph()
 
 
 # FastAPI dependency: decode the Bearer token and return the active User, raising 401 otherwise.
@@ -162,6 +202,7 @@ app.include_router(gmail_router, prefix="", tags=["gmail"])
 app.include_router(policy_router, prefix="/policy", tags=["policy"])
 app.include_router(settings_router, prefix="/settings", tags=["settings"])
 app.include_router(access_requests_router, prefix="", tags=["access-requests"])
+app.include_router(ontology_graph_router, prefix="/ontology-graph", tags=["ontology-graph"])
 
 
 

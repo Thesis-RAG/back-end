@@ -22,6 +22,7 @@ CHAT_MODEL_OPTIONS = [
     {"id": "gpt-5", "label": "GPT-5", "tier": "previous"},
     {"id": "gpt-5-mini", "label": "GPT-5 mini", "tier": "cost"},
     {"id": "gpt-5-nano", "label": "GPT-5 nano", "tier": "cost"},
+    {"id": "gpt-4o-mini", "label": "GPT-4o mini", "tier": "previous"},
 ]
 EMBEDDING_MODEL_OPTIONS = ["text-embedding-3-small", "text-embedding-3-large"]
 

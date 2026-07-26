@@ -42,6 +42,14 @@ from app.schemas.document_entity_access_request import (
     EntityAccessRequestRead,
 )
 from app.services.entity_policy_service import entity_policy_service, normalize_entity_type
+from app.models.message import Message
+from app.models.conversation import Conversation
+from app.repositories.message_entity_repository import message_entity_repository
+from app.schemas.message_entity_access_request import (
+    MessageAccessRequestResolve,
+    MessageEntityAccessRequestCreate,
+    MessageEntityAccessRequestRead,
+)
 
 router = APIRouter()
 
@@ -354,3 +362,118 @@ def reject_entity_access_request(
         raise HTTPException(status_code=404, detail=str(exc)) from exc
     db.commit()
     return _build_entity_read(db, obj)
+
+
+# ── Message-scoped access requests (require tier) ──────────────────────────
+# Appeal for a single message's answer only — never grants standing access
+# to the document, and a repeated question needs a fresh request.
+
+def _build_message_entity_read(db: Session, obj) -> MessageEntityAccessRequestRead:
+    message = db.get(Message, obj.message_id)
+    conversation = db.get(Conversation, message.conversation_id) if message else None
+    requester = db.get(User, obj.user_id)
+    return MessageEntityAccessRequestRead(
+        id=obj.id,
+        message_id=obj.message_id,
+        conversation_id=conversation.id if conversation else None,
+        message_excerpt=(message.content or "")[:280] if message else None,
+        user_id=obj.user_id,
+        requester_name=(getattr(requester, "name", None) or getattr(requester, "email", None)) if requester else None,
+        requester_email=getattr(requester, "email", None) if requester else None,
+        entity_types=list(obj.entity_types_json or []),
+        status=obj.status,
+        admin_id=obj.admin_id,
+        admin_note=obj.admin_note,
+        created_at=obj.created_at,
+        resolved_at=obj.resolved_at,
+    )
+
+
+@router.post("/message-entity-access-requests", response_model=MessageEntityAccessRequestRead, status_code=201)
+def create_message_entity_access_request(
+    payload: MessageEntityAccessRequestCreate,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    message = db.get(Message, payload.message_id)
+    if not message or message.role != "assistant":
+        raise HTTPException(status_code=404, detail="Message not found")
+    conversation = db.get(Conversation, message.conversation_id)
+    if not conversation or conversation.user_id != current_user.id:
+        raise HTTPException(status_code=403, detail="Forbidden")
+
+    masked_types = {
+        normalize_entity_type(mask.get("entity_type") or "")
+        for mask in (message.entity_masks_json or [])
+    }
+    requested = {normalize_entity_type(value) for value in payload.entity_types}
+    requested = requested.intersection(masked_types)
+    if not requested:
+        raise HTTPException(status_code=400, detail="No masked entity requested for this message")
+    if message_entity_repository.has_pending(db, str(current_user.id), message.id, list(requested)):
+        raise HTTPException(status_code=409, detail="Request already pending for this message")
+
+    obj = message_entity_repository.create_access_request(
+        db, message_id=message.id, user_id=str(current_user.id), entity_types=sorted(requested),
+    )
+    db.commit()
+    return _build_message_entity_read(db, obj)
+
+
+@router.get("/message-entity-access-requests/my", response_model=list[MessageEntityAccessRequestRead])
+def my_message_entity_access_requests(
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    return [
+        _build_message_entity_read(db, row)
+        for row in message_entity_repository.list_requests(db, user_id=str(current_user.id))
+    ]
+
+
+@router.get("/message-entity-access-requests", response_model=list[MessageEntityAccessRequestRead])
+def list_message_entity_access_requests(
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    if not _is_corp_member(db, current_user):
+        raise HTTPException(status_code=403, detail="Forbidden")
+    return [_build_message_entity_read(db, row) for row in message_entity_repository.list_requests(db)]
+
+
+@router.put("/message-entity-access-requests/{request_id}/approve", response_model=MessageEntityAccessRequestRead)
+def approve_message_entity_access_request(
+    request_id: str,
+    payload: MessageAccessRequestResolve,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    if not _is_corp_member(db, current_user):
+        raise HTTPException(status_code=403, detail="Forbidden")
+    try:
+        obj = message_entity_repository.resolve(
+            db, request_id, status="approved", admin_id=str(current_user.id), admin_note=payload.admin_note,
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    db.commit()
+    return _build_message_entity_read(db, obj)
+
+
+@router.put("/message-entity-access-requests/{request_id}/reject", response_model=MessageEntityAccessRequestRead)
+def reject_message_entity_access_request(
+    request_id: str,
+    payload: MessageAccessRequestResolve,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    if not _is_corp_member(db, current_user):
+        raise HTTPException(status_code=403, detail="Forbidden")
+    try:
+        obj = message_entity_repository.resolve(
+            db, request_id, status="rejected", admin_id=str(current_user.id), admin_note=payload.admin_note,
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    db.commit()
+    return _build_message_entity_read(db, obj)

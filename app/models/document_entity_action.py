@@ -27,6 +27,10 @@ class DocumentEntityAction(Base, TimestampMixin):
     entity_type = Column(String(128), nullable=False)
     label = Column(String(255), nullable=True)
     action = Column(String(16), nullable=False, default="full")  # block | full | mask
+    # Snapshot of the entity type's sensitivity level (1-5) at the time the
+    # global policy was copied onto this version. See
+    # entity_extractor.compute_chunk_sensitivity.
+    sensitivity = Column(Integer, nullable=False, default=1)
     source = Column(String(16), nullable=False, default="gliner")
     enabled = Column(Boolean, nullable=False, default=True)
     detection_count = Column(Integer, nullable=False, default=0)

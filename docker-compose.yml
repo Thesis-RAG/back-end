@@ -88,6 +88,31 @@ services:
       - "3001:3001"
     restart: unless-stopped
 
+  # Ontology graph database (Neo4j) — the enterprise-ontology visualization
+  # merged into this API (app/services/ontology_sync_service.py,
+  # app/services/ontology_graph_service.py, app/api/v1/ontology_graph.py).
+  # No separate backend process for it anymore; the graph UI lives at
+  # front-end/src/pages/GraphPage.tsx and calls this same api service.
+  neo4j:
+    image: neo4j:5.23-community
+    # NOT env_file: the official neo4j image auto-converts *every* env var
+    # named NEO4J_xxx into a config setting (eg. it tried to read our own
+    # NEO4J_URI as a "URI" config key and refused to boot) — so this
+    # container can only ever be handed the one variable it actually
+    # understands (NEO4J_AUTH), built here from NEO4J_PASSWORD via
+    # Compose's own ${} substitution (reads a `.env` file in this
+    # directory, or the real shell env — see .env.example).
+    environment:
+      NEO4J_AUTH: neo4j/${NEO4J_PASSWORD:-ontology12345}
+      NEO4J_PLUGINS: '["apoc"]'
+    ports:
+      - "7474:7474"
+      - "7687:7687"
+    volumes:
+      - neo4j_data:/data
+      - neo4j_logs:/logs
+    restart: unless-stopped
+
   api:
     build: .
     env_file:
@@ -100,6 +125,7 @@ services:
       - minio
       - openfga
       - chroma
+      - neo4j
     ports:
       - "8000:8000"
     volumes:
@@ -119,6 +145,7 @@ services:
       - minio
       - openfga
       - chroma
+      - neo4j
     command: celery -A app.workers.tasks.celery_app worker -Q ingest_queue -l info --concurrency=1
     volumes:
       - .:/app
@@ -129,3 +156,5 @@ volumes:
   minio_data:
   chroma_data:
   postgres_fga_data:
+  neo4j_data:
+  neo4j_logs:

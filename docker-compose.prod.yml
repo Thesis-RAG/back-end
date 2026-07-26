@@ -104,6 +104,28 @@ services:
       - chroma_data:/chroma/chroma
     restart: unless-stopped
 
+  # Ontology graph (the "Cấu hình thực thể > Xem đồ thị" visualization).
+  # No host ports published — same "do not expose internal services"
+  # policy as the rest of this stack (see README); api/worker reach it by
+  # service name over the internal Docker network only.
+  neo4j:
+    image: neo4j:5.23-community
+    environment:
+      # Same requirement as MYSQL_PASSWORD etc. below — must be set, and
+      # must match NEO4J_PASSWORD (the value the api/worker Python code
+      # connects with, read further down via env_file).
+      NEO4J_AUTH: neo4j/${NEO4J_PASSWORD:?NEO4J_PASSWORD is required}
+      NEO4J_PLUGINS: '["apoc"]'
+    volumes:
+      - neo4j_data:/data
+      - neo4j_logs:/logs
+    healthcheck:
+      test: ["CMD-SHELL", "wget -qO- http://localhost:7474 || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 12
+    restart: unless-stopped
+
   api:
     build:
       context: .
@@ -126,6 +148,8 @@ services:
       minio:
         condition: service_started
       chroma:
+        condition: service_started
+      neo4j:
         condition: service_started
     expose:
       - "8000"
@@ -155,6 +179,8 @@ services:
         condition: service_started
       chroma:
         condition: service_started
+      neo4j:
+        condition: service_started
     command: celery -A app.workers.tasks.celery_app worker -Q ingest_queue -l info --concurrency=1
     restart: unless-stopped
 
@@ -183,3 +209,5 @@ volumes:
   caddy_data:
   caddy_config:
   openfga_config:
+  neo4j_data:
+  neo4j_logs:

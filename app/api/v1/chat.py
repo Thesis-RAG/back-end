@@ -58,6 +58,7 @@ def post_message(conversation_id: str, payload: MessageCreateRequest, request: R
     )
 
     src_objs = [SourceRead(**s) for s in (sources or [])]
+    require_types = sorted({t for s in src_objs for t in (s.requireEntityTypes or [])})
 
     return MessagePostResponse(
         conversationId=conversation_id,
@@ -68,6 +69,7 @@ def post_message(conversation_id: str, payload: MessageCreateRequest, request: R
             "status": assistant_msg.status,
             "createdAt": assistant_msg.created_at,
             "appliedRules": assistant_msg.applied_rules_json or [],
+            "requireEntityTypes": require_types,
         },
         traceId=request.state.trace_id,
         sources=src_objs,
@@ -84,7 +86,7 @@ def get_messages(conversation_id: str, db: Session = Depends(get_db), current_us
     if not conv or conv.status != "open":
         raise HTTPException(status_code=404, detail="Conversation not found")
 
-    msgs = chat_service.list_messages_flat(db, conversation_id, limit=1000)
+    msgs = chat_service.list_messages_flat(db, conversation_id, limit=1000, user=current_user)
     return msgs
 
 
@@ -190,10 +192,9 @@ def search_documents(
     results = retrieval_service.retrieve(
         query=query, user=current_user, top_k=top_k, mode=mode, db=db
     )
-    if not entity_policy_service.bypasses_entity_actions(current_user):
-        results, _contracts = entity_policy_service.apply_to_retrieved(
-            db, current_user, query, results
-        )
+    results, _contracts = entity_policy_service.apply_to_retrieved(
+        db, current_user, query, results
+    )
 
     # Enrich document_type from DB for chunks whose Chroma metadata still has "general".
     stale_doc_ids = {
