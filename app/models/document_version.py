@@ -1,4 +1,4 @@
-from sqlalchemy import Column, ForeignKey, Integer, JSON, String, Text
+from sqlalchemy import Column, DateTime, ForeignKey, Integer, JSON, String, Text
 from sqlalchemy.orm import relationship
 
 from app.db.base import Base, TimestampMixin
@@ -33,6 +33,15 @@ class DocumentVersion(Base, TimestampMixin):
     chunk_config_json = Column(JSON, nullable=True)
     # Full-document entity detection snapshot produced during ingest.
     entity_detection_json = Column(JSON, nullable=True)
+
+    # Digital signature over this version's chunk content (see
+    # document_signing_service). Set once ingest finishes; content_hash is
+    # the sha256 the signature covers, stored for quick audit without
+    # re-running crypto verify.
+    content_hash = Column(String(128), nullable=True)
+    content_signature = Column(Text, nullable=True)
+    content_signature_key_id = Column(String(64), nullable=True)
+    content_signed_at = Column(DateTime, nullable=True)
 
     document = relationship("Document", back_populates="versions", foreign_keys=[document_id])
     source_object = relationship("StorageObject", foreign_keys=[source_object_id])

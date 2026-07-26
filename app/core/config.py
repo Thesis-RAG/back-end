@@ -73,6 +73,11 @@ class Settings(BaseSettings):
     neo4j_user: str = "neo4j"
     neo4j_password: str = "ontology12345"
 
+    # Document content-signing private key (Ed25519, PEM). Kept as a file
+    # outside the database on purpose — see document_signing_service.py.
+    # Auto-generated on first use if the file doesn't exist yet.
+    document_signing_key_path: str = "/app/.secrets/document_signing_ed25519.pem"
+
 
 # Module-level singleton; import this instance throughout the application.
 settings = Settings()

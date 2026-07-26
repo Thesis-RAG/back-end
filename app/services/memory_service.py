@@ -165,28 +165,35 @@ class MemoryService:
     # ------------------------------------------------------------------
 
     # Group a flat message list into consecutive (user, assistant) Q&A pairs.
+    # Pair via parent_message_id, not list adjacency — messages.created_at is
+    # whole-second precision (MySQL DATETIME), so a user message and its
+    # assistant reply created within the same second can come back from
+    # `ORDER BY created_at ASC` in either order (id is a random UUID, no
+    # tiebreaker). Adjacency-based pairing silently drops that whole Q&A
+    # turn from memory whenever that tie happens. parent_message_id is set
+    # on every assistant message regardless of timing, so it's the reliable
+    # link (see _load_recent_turns_direct, which already relies on this).
     def _build_pairs(self, messages):
+        assistant_by_parent = {
+            m.parent_message_id: m
+            for m in messages
+            if m.role == "assistant" and m.parent_message_id
+        }
         pairs = []
-        i = 0
-        while i < len(messages):
-            m = messages[i]
-            if (
-                m.role == "user"
-                and i + 1 < len(messages)
-                and messages[i + 1].role == "assistant"
-            ):
-                assistant = messages[i + 1]
-                is_done = assistant.status in DONE_STATUSES
-                is_streaming_with_content = (
-                    assistant.status == "streaming"
-                    and assistant.content
-                    and len(assistant.content.strip()) > 10  # có nội dung thật
-                )
-                if is_done or is_streaming_with_content:
-                    pairs.append((m, assistant))
-                i += 2
-            else:
-                i += 1
+        for m in messages:
+            if m.role != "user":
+                continue
+            assistant = assistant_by_parent.get(m.id)
+            if not assistant:
+                continue
+            is_done = assistant.status in DONE_STATUSES
+            is_streaming_with_content = (
+                assistant.status == "streaming"
+                and assistant.content
+                and len(assistant.content.strip()) > 10  # có nội dung thật
+            )
+            if is_done or is_streaming_with_content:
+                pairs.append((m, assistant))
         return pairs
 
     # Return the top_k pairs most relevant to the query via embedding similarity, falling back to keyword overlap.

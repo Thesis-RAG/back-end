@@ -48,6 +48,10 @@ Thumbs.db
 !.env.example
 !.env.prod.example
 
+# Document-signing private key — must never be committed (see
+# app/services/document_signing_service.py).
+.secrets/
+
 # Logs
 *.log
 logs/

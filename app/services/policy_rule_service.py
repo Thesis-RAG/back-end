@@ -1,6 +1,7 @@
 """Global policy rule management and immutable policy snapshot helpers."""
 from __future__ import annotations
 
+import logging
 import re
 from typing import Iterable
 
@@ -10,6 +11,7 @@ from app.core.config import settings
 from app.models.entity_policy_rule import EntityPolicyRule
 from app.repositories.system_setting_repository import system_setting_repository
 
+logger = logging.getLogger(__name__)
 
 DEFAULT_POLICY_PROFILE = "enterprise_secure"
 POLICY_VERSION_KEY = "policy.version"
@@ -24,13 +26,62 @@ def normalize_entity_key(value: str) -> str:
     return re.sub(r"[^a-zA-Z0-9_]+", "_", str(value or "").strip().lower()).strip("_")[:128]
 
 
+# Query the ontology graph (Neo4j) for every OUI-instance reachable as a
+# descendant of the user's own OUI(s), via the BELONGS_TO tree synced in
+# ontology_sync_service.sync_org_unit_instance(). Mirrors the FGA
+# ancestor_viewer semantic (a user at a parent OUI can already view a child
+# OUI's documents) so entity-scope pairs — which otherwise only exact-match
+# a user's own OUI — can recognize "my OUI or anything beneath it" too.
+# Call once per request (not per rule/entity) and thread the result through
+# resolve_tier's expanded_oui_ids param. Best-effort: any Neo4j hiccup
+# degrades to exact-match-only scope resolution, never raises, never
+# blocks the chat — same non-fatal contract as the rest of the graph layer.
+def expand_oui_ids_via_graph(user) -> set[str]:
+    own_oui_ids = {
+        str(getattr(assignment, "oui_id", "") or "")
+        for assignment in getattr(user, "oui_positions", []) or []
+    }
+    own_oui_ids.discard("")
+    if not own_oui_ids:
+        return set()
+    try:
+        from app.db.neo4j_client import get_session as get_neo4j_session
+
+        with get_neo4j_session() as session:
+            result = session.run(
+                """
+                MATCH (ancestor:OntologyNode {sourceType: 'org_unit_instance'})
+                WHERE ancestor.sourceId IN $ouiIds
+                MATCH (descendant:OntologyNode {sourceType: 'org_unit_instance'})
+                      -[:BELONGS_TO*0..]->(ancestor)
+                RETURN DISTINCT descendant.sourceId AS id
+                """,
+                ouiIds=list(own_oui_ids),
+            )
+            return {record["id"] for record in result if record["id"]}
+    except Exception:
+        logger.warning("[policy] expand_oui_ids_via_graph failed, falling back to exact-match scope", exc_info=True)
+        return set()
+
+
 # Return True if any of the user's OUI/Position assignments matches one of
 # the scope's explicit (oui_id, position_id) pairs. A null side of a pair
 # means "any" on that dimension. Pairs are OR'd together; within one pair,
 # the two dimensions are AND'd — this is what lets "HCM's Trưởng chi nhánh"
 # and "Hà Nội's Phó chi nhánh" be selected independently, unlike the old
 # two-flat-lists model which always matched their full cartesian product.
-def _scope_matches(pairs: list[dict] | None, user) -> bool:
+#
+# expanded_oui_ids (optional): OUI ids the user counts as "their own" via
+# org-hierarchy inheritance (see expand_oui_ids_via_graph) — mirrors FGA's
+# ancestor_viewer, which grants a user at a parent OUI visibility into a
+# descendant OUI's documents regardless of which position at that descendant
+# "owns" them. Same rule here: a pair's position_id only narrows who *at
+# that exact OUI* matches on direct assignment (checked above); it must NOT
+# also gate ancestor inheritance below — someone matching only via
+# expanded_oui_ids isn't a peer at that OUI at all, they're a manager above
+# it, so the pair's position pin (meant to pick a role *within* that OUI)
+# has nothing to say about them one way or the other.
+def _scope_matches(pairs: list[dict] | None, user, expanded_oui_ids: set[str] | None = None) -> bool:
     pairs = pairs or []
     if any(pair.get("oui_id") == ALL_SENTINEL or pair.get("position_id") == ALL_SENTINEL for pair in pairs):
         return True
@@ -47,18 +98,27 @@ def _scope_matches(pairs: list[dict] | None, user) -> bool:
             if pair_pos and str(pair_pos) != position_id:
                 continue
             return True
+    if expanded_oui_ids:
+        for pair in pairs:
+            pair_oui = pair.get("oui_id")
+            if pair_oui and str(pair_oui) in expanded_oui_ids:
+                return True
     return False
 
 
 # Resolve the effective tier for one rule against one user.
 # Priority: allow > mask > block. block is the pure fallback — anyone
 # matching neither allow_scope nor mask_scope is hard-blocked, no appeal.
-def resolve_tier(rule: EntityPolicyRule, user) -> dict:
+#
+# expanded_oui_ids: pass the result of expand_oui_ids_via_graph(user), computed
+# once by the caller for the whole request, so a single chat turn costs at
+# most one graph round-trip regardless of how many entities/chunks it scores.
+def resolve_tier(rule: EntityPolicyRule, user, expanded_oui_ids: set[str] | None = None) -> dict:
     if not rule.enabled:
         return {"tier": "block"}
-    if _scope_matches(rule.allow_scope_pairs, user):
+    if _scope_matches(rule.allow_scope_pairs, user, expanded_oui_ids):
         return {"tier": "full"}
-    if _scope_matches(rule.mask_scope_pairs, user):
+    if _scope_matches(rule.mask_scope_pairs, user, expanded_oui_ids):
         return {
             "tier": "require",
             "mask_style": rule.mask_style or "full",

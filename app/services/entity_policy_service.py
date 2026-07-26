@@ -14,7 +14,12 @@ from app.models.document_version import DocumentVersion
 from app.repositories.document_entity_repository import document_entity_repository
 from app.services.entity_extractor import extract_realtime_batch_detailed, run_pipeline
 from app.services.parser_service import parser_service
-from app.services.policy_rule_service import DEFAULT_POLICY_PROFILE, policy_rule_service, resolve_tier
+from app.services.policy_rule_service import (
+    DEFAULT_POLICY_PROFILE,
+    expand_oui_ids_via_graph,
+    policy_rule_service,
+    resolve_tier,
+)
 from app.services.user_service import user_service
 
 
@@ -69,6 +74,16 @@ def normalize_actions(actions: Iterable[dict]) -> list[dict]:
     return result
 
 
+# Mask character shown to the LLM/user for hidden values — kept in one place
+# so the whole masking scheme (fixed placeholder + partial mask) stays
+# consistent if this ever changes again.
+_MASK_CHAR = "•"
+
+# Fixed-length placeholder for fully-masked ("mask_style=full") values — a
+# constant length so the mask itself never leaks how long the real value was.
+_MASK_PLACEHOLDER = _MASK_CHAR * 16
+
+
 # Mask part of a value's text, keeping the rest visible for context/verification.
 # position="head" masks the start (keeps the tail visible), "tail" masks the
 # end (keeps the head visible), "center" keeps both ends and masks the middle.
@@ -76,15 +91,15 @@ def _partial_mask(text: str, position: str | None) -> str:
     text = text or ""
     n = len(text)
     if n <= 2:
-        return "*" * n
+        return _MASK_CHAR * n
     keep = max(1, n // 4)
     if position == "head":
-        return "*" * (n - keep) + text[-keep:]
+        return _MASK_CHAR * (n - keep) + text[-keep:]
     if position == "center":
         half = max(1, keep // 2)
-        return text[:half] + "*" * (n - 2 * half) + text[-half:]
+        return text[:half] + _MASK_CHAR * (n - 2 * half) + text[-half:]
     # default: tail
-    return text[:keep] + "*" * (n - keep)
+    return text[:keep] + _MASK_CHAR * (n - keep)
 
 
 def _replace_entity_spans(
@@ -113,6 +128,39 @@ def _replace_entity_spans(
         output = output[:start] + replacement + output[end:]
         occupied_start = start
     return output
+
+
+_TABLE_ROW_RE = re.compile(r"^\|([^|\n]*)\|([^|\n]*)\|$")
+# A value cell counts as "empty" once only separator punctuation/whitespace
+# is left in it — the actual content (all of it, or every comma-joined
+# sub-value) was erased by a block-tier replacement.
+_SEPARATOR_ONLY_RE = re.compile(r"^[,.\s]*$")
+_REPEAT_SEPARATOR_RE = re.compile(r"(?:[,.]\s*){2,}")
+
+
+def _tidy_masked_table_rows(text: str) -> str:
+    """Clean up table rows after entity erasure/masking.
+
+    Block-tier erasure removes only the matched span, not the comma/pipe
+    punctuation around it — a row like "| Địa chỉ | ••••, , ,  |" (some
+    sub-values masked, others erased) or "| Số điện thoại |  |" (erased
+    entirely) is technically valid markdown but reads as broken. Drop rows
+    whose value is now nothing but leftover separators (no label revealed
+    either — consistent with "erase all trace"), and collapse repeated
+    separators in rows that still have real (or masked) content.
+    """
+    lines: list[str] = []
+    for line in text.split("\n"):
+        match = _TABLE_ROW_RE.match(line.strip())
+        if not match:
+            lines.append(line)
+            continue
+        label, value = match.group(1).strip(), match.group(2).strip()
+        if _SEPARATOR_ONLY_RE.match(value):
+            continue
+        value = _REPEAT_SEPARATOR_RE.sub(", ", value).strip(" ,.")
+        lines.append(f"| {label} | {value} |")
+    return "\n".join(lines)
 
 
 class EntityPolicyService:
@@ -168,7 +216,7 @@ class EntityPolicyService:
                 if rule and rule.mask_style == "partial":
                     masked_repr = _partial_mask(real_text, rule.mask_position)
                 else:
-                    masked_repr = f"[Đã che thực thể '{label}']"
+                    masked_repr = _MASK_PLACEHOLDER
                 if masked_repr in revealed:
                     revealed = revealed.replace(masked_repr, real_text)
         return revealed
@@ -333,9 +381,10 @@ class EntityPolicyService:
         if not detected_types:
             return set()
         rules = policy_rule_service.rules_by_key(db, detected_types)
+        expanded_oui_ids = expand_oui_ids_via_graph(user)
         return {
             label for label in detected_types
-            if label in rules and resolve_tier(rules[label], user)["tier"] == "block"
+            if label in rules and resolve_tier(rules[label], user, expanded_oui_ids)["tier"] == "block"
         }
 
     def has_entity_access(self, db: Session, user, document_id: str, version_id: str, entity_types: set[str]) -> bool:
@@ -364,6 +413,10 @@ class EntityPolicyService:
         )
         processed: list[dict] = []
         contracts: list[dict] = []
+        # One graph round-trip per chat turn, reused for every chunk/entity
+        # below — see expand_oui_ids_via_graph's docstring for why this
+        # can't just be an exact match on the user's own OUI.
+        expanded_oui_ids = expand_oui_ids_via_graph(user)
 
         for chunk, detail in zip(chunks, details):
             result = dict(chunk)
@@ -374,27 +427,30 @@ class EntityPolicyService:
             entities = detail.get("entities") or []
             detected_types = {normalize_entity_type(value) for value in detail.get("entity_types") or []}
 
+            values_by_label: dict[str, list[str]] = {}
+            for entity in entities:
+                label = normalize_entity_type(entity.get("label") or "")
+                text_value = str(entity.get("text") or "")
+                if label and text_value:
+                    values_by_label.setdefault(label, []).append(text_value)
+
             rules = policy_rule_service.rules_by_key(db, detected_types)
             resolved = {
-                label: resolve_tier(rules[label], user)
+                label: resolve_tier(rules[label], user, expanded_oui_ids)
                 for label in detected_types
                 if label in rules
             }
             blocked_types = {label for label, res in resolved.items() if res["tier"] == "block"}
             require_types = {label for label, res in resolved.items() if res["tier"] == "require"}
 
-            # block: always masked, no appeal path — a hard denial with
-            # nothing to request (unlike require, which stays reveal-able
-            # via the per-message flow below).
-            replacements: dict[str, object] = {
-                label: f"[Thực thể '{label}' đã bị ẩn theo chính sách]"
-                for label in blocked_types
-            }
+            # block: erase the span entirely — the LLM never sees any trace
+            # that a value was even there (no placeholder, no appeal path).
+            replacements: dict[str, object] = {label: "" for label in blocked_types}
 
             # require: never revealed at generation time (no message_id yet
-            # to check a per-message grant against) — always masked here.
-            # Reveal happens later, per-message, when serving a persisted
-            # message via reveal_for_message().
+            # to check a per-message grant against) — always masked as a
+            # run of asterisks here. Reveal happens later, per-message, when
+            # serving a persisted message via reveal_for_message().
             for label in require_types:
                 if label in replacements:
                     continue
@@ -405,11 +461,11 @@ class EntityPolicyService:
                         lambda entity, _pos=position: _partial_mask(str(entity.get("text") or ""), _pos)
                     )
                 else:
-                    replacements[label] = f"[Đã che thực thể '{label}']"
+                    replacements[label] = _MASK_PLACEHOLDER
 
-            result["document_text"] = _replace_entity_spans(
+            result["document_text"] = _tidy_masked_table_rows(_replace_entity_spans(
                 str(chunk.get("document_text") or ""), entities, replacements
-            )
+            ))
             metadata.update({
                 # No appeal exists for block tier anymore, so this chunk
                 # never needs the document-level access-request UI.
@@ -448,6 +504,9 @@ class EntityPolicyService:
                         "entity_type": label,
                         "tier": res["tier"],
                         "display_name": rules[label].display_name,
+                        # Raw detected values (GLiNER/regex), for debugging/audit —
+                        # never sent to the LLM, only ever surfaced in logs/traces.
+                        "values": values_by_label.get(label, []),
                     }
                     for label, res in sorted(resolved.items())
                 ],

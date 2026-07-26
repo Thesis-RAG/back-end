@@ -77,12 +77,23 @@ class EmbeddingService:
                 values = system_setting_repository.get_all(db)
             selected_provider = (values.get("llm.provider") or self.provider).lower()
             selected_model = values.get("llm.embedding_model") or self.model_name
-            if selected_provider != self.provider or selected_model != self.model_name:
-                self.provider = selected_provider
-                self.model_name = selected_model
-                self.client = None
-                if self.provider == "openai" and OpenAI is not None and self.api_key:
-                    self.client = OpenAI(api_key=self.api_key, base_url=self.base_url or None)
+            if selected_provider == self.provider and selected_model == self.model_name:
+                return
+            # Build the replacement client BEFORE touching self.client — this
+            # method runs on every embed_many() call, and embed_many() can now
+            # be called concurrently (retrieval_service.retrieve_multi fans
+            # sub-queries out to worker threads). Never leave self.client
+            # transiently None: another thread already past this check could
+            # read it mid-flight and fail with "not configured" even though
+            # nothing is actually wrong.
+            new_client = (
+                OpenAI(api_key=self.api_key, base_url=self.base_url or None)
+                if selected_provider == "openai" and OpenAI is not None and self.api_key
+                else None
+            )
+            self.provider = selected_provider
+            self.model_name = selected_model
+            self.client = new_client
         except Exception:
             logger.debug("Runtime embedding settings unavailable; keeping current configuration", exc_info=True)
 

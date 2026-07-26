@@ -302,6 +302,22 @@ class OntologySyncService:
                 if scope_node_id:
                     ensure_edge(session, node_id, scope_node_id, "IS_A")
 
+                # Real OUI-instance parent tree (oui_parents table — same
+                # relation FGA's ancestor_viewer walks), separate from the
+                # IS_A edge above (which only points at the *type* taxonomy).
+                # This is what lets entity-policy scope matching later expand
+                # "my OUI" into "my OUI and everything beneath it" via a
+                # graph path query, instead of only exact-matching — closing
+                # the gap where a parent-OUI user can already view a child
+                # OUI's document (via FGA ancestor_viewer) but every field in
+                # it would otherwise hard-block since no scope pair names
+                # their own OUI exactly.
+                clear_edges(session, node_id, "BELONGS_TO")
+                for parent in instance.parents:
+                    parent_node_id = find_by_source(session, "org_unit_instance", parent.id)
+                    if parent_node_id:
+                        ensure_edge(session, node_id, parent_node_id, "BELONGS_TO")
+
             # A brand-new instance needs a position-instance node for every
             # Position that already exists for its OU type — sync_position()
             # normally does that fan-out, but only runs when a Position

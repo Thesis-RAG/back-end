@@ -21,9 +21,11 @@ from app.schemas.document import ChunkingConfig
 from app.services.audit_service import audit_service
 from app.services.chunker_service import ChunkConfig, chunker_service
 from app.services.chroma_service import chroma_service
+from app.services.document_signing_service import document_signing_service
 from app.services.embedding_service import embedding_service
 from app.services.job_service import job_service
 from app.services.parser_service import parser_service
+from app.services.retrieval_service import retrieval_service
 from app.services.storage_service import storage_service
 from app.services.entity_policy_service import entity_policy_service
 
@@ -315,7 +317,7 @@ class IngestPipelineService:
                 }
                 chroma_service.upsert_chunk(
                     chunk_id=chunk_model.id,
-                        document_text=chunk_dict.get("embed_text") or chunk_dict["chunk_text"],  
+                    document_text=chunk_dict.get("embed_text") or chunk_dict["chunk_text"],
                     embedding=vector,
                     metadata=metadata,
                 )
@@ -340,6 +342,19 @@ class IngestPipelineService:
             )
             version.embed_status  = "completed"
             version.ingest_status = "succeeded"
+
+            # Sign this version's content now that every chunk_hash is final —
+            # ties the signature to what's actually searchable (chunk_text),
+            # not just the raw uploaded bytes (see document_signing_service).
+            content_hash = document_signing_service.compute_content_hash(
+                [c.chunk_hash for c in chunk_models]
+            )
+            signature_b64, key_id, signed_at = document_signing_service.sign(content_hash)
+            version.content_hash              = content_hash
+            version.content_signature         = signature_b64
+            version.content_signature_key_id  = key_id
+            version.content_signed_at         = signed_at
+            retrieval_service.invalidate_signature_cache(version.id)
 
             if pre_ingest_status == "approved":
                 doc.status = "approved"
