@@ -25,6 +25,7 @@ google-api-python-client
 alembic
 rank-bm25==0.2.2
 gliner==0.2.27
+sentence-transformers==3.3.1
 neo4j==5.24.0
 deep-translator==1.11.4
 

@@ -21,6 +21,7 @@ from app.fga.adapter import fga_adapter
 from app.repositories.chroma_repository import ChromaRepository
 from app.services.document_signing_service import document_signing_service
 from app.services.embedding_service import embedding_service
+from app.core.config import settings
 
 logger = logging.getLogger(__name__)
 
@@ -76,6 +77,8 @@ class RetrievalService:
         self.semantic_candidates = semantic_candidates
         self.lexical_candidates  = lexical_candidates
         self.minimum_score       = minimum_score
+        self._reranker = None
+        self._reranker_load_failed = False
 
     # ------------------------------------------------------------------
     # Similarity conversion  (cosine space only)
@@ -279,7 +282,9 @@ class RetrievalService:
     
     # Return chunk sensitivity as int 1-5; falls back to regex pattern scan if metadata is absent.
     def _classify_chunk_sensitivity(self, chunk: dict) -> int:
-        meta = chunk.get("metadata", {}).get("sensitivity")
+        metadata = chunk.get("metadata", {}) or {}
+        # Ingested chunks use chunk_sensitivity; legacy records use sensitivity.
+        meta = metadata.get("chunk_sensitivity") or metadata.get("sensitivity")
         if meta is not None:
             try:
                 v = int(meta)
@@ -373,6 +378,108 @@ class RetrievalService:
             + (1.0 - _DISPLAY_ALPHA_SEMANTIC) * kw_val
         )
         return round(min(1.0, max(0.0, display)), 6), kw_abs
+
+    # ------------------------------------------------------------------
+    # Cross-encoder reranking after RRF
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _sigmoid(value: float) -> float:
+        """Numerically stable sigmoid for a raw cross-encoder logit."""
+        if value >= 0.0:
+            z = math.exp(-value)
+            return 1.0 / (1.0 + z)
+        z = math.exp(value)
+        return z / (1.0 + z)
+
+    def _get_reranker(self):
+        """Load the CrossEncoder lazily so API startup does not download a model."""
+        if not settings.reranker_enabled or self._reranker_load_failed:
+            return None
+        if self._reranker is None:
+            try:
+                from sentence_transformers import CrossEncoder
+
+                self._reranker = CrossEncoder(settings.reranker_model_name)
+                logger.info("Loaded retrieval reranker model=%s", settings.reranker_model_name)
+            except Exception:
+                self._reranker_load_failed = True
+                logger.exception(
+                    "Could not load reranker model=%s; keeping RRF order",
+                    settings.reranker_model_name,
+                )
+                return None
+        return self._reranker
+
+    def _rerank_after_rrf(
+        self,
+        query: str,
+        results: list[dict],
+        user_clearance: int = 1,
+    ) -> list[dict]:
+        """Apply RWSS = alpha*sigmoid(sce) - beta*clearance penalty.
+
+        RRF creates the candidate pool. The returned ``score`` is the final
+        RWSS score and the original RRF score remains available for auditing.
+        """
+        if not results or not settings.reranker_enabled:
+            return results
+
+        reranker = self._get_reranker()
+        if reranker is None:
+            return results
+
+        pairs = [(query, str(item.get("document_text") or "")) for item in results]
+        try:
+            raw_scores = reranker.predict(
+                pairs,
+                batch_size=max(1, settings.reranker_batch_size),
+                show_progress_bar=False,
+            )
+        except Exception:
+            logger.exception("Cross-encoder reranking failed; keeping RRF order")
+            return results
+
+        if len(raw_scores) != len(results):
+            logger.warning(
+                "Reranker returned %d scores for %d candidates; keeping RRF order",
+                len(raw_scores), len(results),
+            )
+            return results
+
+        alpha = float(settings.reranker_alpha)
+        beta = float(settings.reranker_beta)
+        l_max = max(2, int(settings.reranker_max_sensitivity))
+        denominator = float(l_max - 1)
+        ranked = []
+
+        for item, raw_score in zip(results, raw_scores):
+            try:
+                sce = float(raw_score)
+                if not math.isfinite(sce):
+                    raise ValueError("non-finite score")
+            except (TypeError, ValueError):
+                sce = 0.0
+
+            chunk_level = self._classify_chunk_sensitivity(item)
+            penalty = max(0.0, float(chunk_level - int(user_clearance))) / denominator
+            penalty = min(1.0, penalty)
+            probability = self._sigmoid(sce)
+            rwss = alpha * probability - beta * penalty
+
+            reranked = dict(item)
+            reranked["cross_encoder_score"] = round(sce, 6)
+            reranked["cross_encoder_probability"] = round(probability, 6)
+            reranked["clearance_penalty"] = round(penalty, 6)
+            reranked["score"] = round(rwss, 6)
+            reranked["rerank_score"] = round(rwss, 6)
+            ranked.append(reranked)
+
+        ranked.sort(
+            key=lambda item: (item["rerank_score"], item.get("rrf_score", 0.0)),
+            reverse=True,
+        )
+        return ranked
 
     # ------------------------------------------------------------------
     # Main retrieve
@@ -549,11 +656,15 @@ class RetrievalService:
                 "document_text": item["document_text"],
                 "metadata": item["metadata"] or {},
                 "score": display_score,
+                "rrf_score": item.get("rrf_score"),
                 "semantic_score": round(sem, 6) if sem is not None else None,
                 "keyword_score": round(kw_abs, 6) if kw_abs is not None else None,
                 "sources": item.get("sources", []),
             })
 
+        results = self._rerank_after_rrf(
+            query, results, user_clearance=self._get_user_clearance(user)
+        )
         return results[:top_k]
     
 
@@ -734,6 +845,7 @@ class RetrievalService:
                     "document_text":  item["document_text"],
                     "metadata":       meta,
                     "score":          display_score,
+                    "rrf_score":      item.get("rrf_score"),
                     "semantic_score": round(sem, 6) if sem is not None else None,
                     "keyword_score":  round(kw_abs, 6) if kw_abs is not None else None,
                     "sources":        item.get("sources", []),
@@ -748,6 +860,7 @@ class RetrievalService:
                         "document_text":  item["document_text"],
                         "metadata":       meta,
                         "score":          display_score,
+                        "rrf_score":      item.get("rrf_score"),
                         "semantic_score": round(sem, 6) if sem is not None else None,
                         "keyword_score":  round(kw_abs, 6) if kw_abs is not None else None,
                         "sources":        item.get("sources", []),
@@ -763,6 +876,7 @@ class RetrievalService:
 
         results = self._post_filter_oui(results, oui_ids)
         results = self._verify_content_signatures(results, db)
+        results = self._rerank_after_rrf(query, results, user_clearance=user_clearance)
         return results[:top_k]
 
     # Drop chunks belonging to a document_version whose stored signature no

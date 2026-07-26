@@ -49,6 +49,14 @@ class Settings(BaseSettings):
     gliner_model_name: str = "urchade/gliner_multi-v2.1"
     gliner_threshold: float = 0.3
 
+    # Cross-encoder reranking applied after RRF candidate fusion.
+    reranker_enabled: bool = True
+    reranker_model_name: str = "BAAI/bge-reranker-base"
+    reranker_alpha: float = 0.8
+    reranker_beta: float = 0.2
+    reranker_max_sensitivity: int = 5
+    reranker_batch_size: int = 16
+
     # LLM configuration
     llm_provider: str | None = None
 
