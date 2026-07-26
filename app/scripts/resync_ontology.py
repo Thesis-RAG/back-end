@@ -50,6 +50,26 @@ def _topo_org_units(units: list[OrgUnit]) -> list[OrgUnit]:
     return ordered
 
 
+def _topo_oui_instances(instances: list[OrgUnitInstance]) -> list[OrgUnitInstance]:
+    """Same ordering problem as _topo_org_units, one level down: an OUI
+    instance can have several parents (oui_parents is many-to-many), and
+    sync_org_unit_instance's BELONGS_TO edge only gets created if the parent
+    instance's node already exists in the graph."""
+    done: set[str] = set()
+    ordered: list[OrgUnitInstance] = []
+    remaining = list(instances)
+    while remaining:
+        ready = [i for i in remaining if all(p.id in done for p in i.parents)]
+        if not ready:
+            ordered.extend(remaining)  # dangling/cyclic parent — bail rather than loop forever
+            break
+        for instance in ready:
+            ordered.append(instance)
+            done.add(instance.id)
+        remaining = [i for i in remaining if i.id not in done]
+    return ordered
+
+
 # Core logic, reusable — takes an existing session, never exits the
 # process. Called both by main() below (its own session, CLI use) and by
 # app.main's startup hook (the request-scoped session there).
@@ -59,7 +79,7 @@ def run(db: "Session") -> None:
     for unit in org_units:
         ontology_sync_service.sync_org_unit(unit)
 
-    instances = db.query(OrgUnitInstance).all()
+    instances = _topo_oui_instances(db.query(OrgUnitInstance).all())
     print(f"[2/5] {len(instances)} org unit instance...")
     for instance in instances:
         ontology_sync_service.sync_org_unit_instance(instance)

@@ -8,13 +8,18 @@ from app.repositories.chroma_repository import ChromaRepository, _segment_vi
 
 import logging
 import math
+import time
+from concurrent.futures import ThreadPoolExecutor
 from typing import Any
 import re
 
 from app.services.sensitivity_levels import SENSITIVITY_PATTERNS, MIN_SENSITIVITY, MAX_SENSITIVITY
 from app.models.document import Document
+from app.models.document_chunk import DocumentChunk
+from app.models.document_version import DocumentVersion
 from app.fga.adapter import fga_adapter
 from app.repositories.chroma_repository import ChromaRepository
+from app.services.document_signing_service import document_signing_service
 from app.services.embedding_service import embedding_service
 
 logger = logging.getLogger(__name__)
@@ -22,6 +27,16 @@ logger = logging.getLogger(__name__)
 # RRF constant – higher k → smoother ranking (less sensitive to top ranks)
 _RRF_K = 60
 GMAIL_CHROMA_COLLECTION = "gmail_chunks"
+
+# Content-signature verification cache: re-hashing every chunk of a version
+# on every single query doesn't scale with document size, and legitimate
+# content essentially never changes between two consecutive requests. Cache
+# the verdict per version_id for a bounded window instead of per-query —
+# trades "detect tampering instantly" for "detect within this many seconds",
+# which is the right trade for a DB-tampering threat model (not a live
+# request-smuggling one).
+_SIGNATURE_CACHE_TTL_SECONDS = 300
+_signature_verify_cache: dict[str, tuple[bool, float]] = {}
 
 # ----------------------------------------------------------------------
 # Display-score combination (NOT used for ranking, only for UI %)
@@ -407,8 +422,70 @@ class RetrievalService:
             return self._retrieve_main(
                 query=query, user=user, top_k=top_k, mode=mode, oui_ids=oui_ids, db=db
             )
-            
-            
+
+    # Fan a compound question's decomposed sub-queries out to independent
+    # retrieve() calls (in parallel, since each is I/O-bound: embedding call,
+    # Chroma HTTP query, MySQL lookups), then merge and dedupe by chunk_id —
+    # a chunk relevant to more than one sub-query is only counted/detected
+    # once, keeping the entity-policy GLiNER pass (run once downstream over
+    # the merged list) from doing duplicate work.
+    def retrieve_multi(
+        self,
+        *,
+        sub_queries: list[str],
+        user=None,
+        top_k: int = 5,
+        mode: str = "hybrid",
+        oui_ids: list[str] | None = None,
+        chat_mode: str = "rag",
+        db=None,
+    ) -> list[dict]:
+        queries = [q.strip() for q in (sub_queries or []) if q and q.strip()]
+        if not queries:
+            return []
+        if len(queries) == 1:
+            return self.retrieve(
+                query=queries[0], user=user, top_k=top_k, mode=mode,
+                oui_ids=oui_ids, chat_mode=chat_mode, db=db,
+            )
+
+        # Each worker thread uses its own DB session — SQLAlchemy sessions
+        # (and lazy-loading ORM instances tied to one) aren't safe to share
+        # across threads. Touch the lazy relationships _retrieve_main reads
+        # off `user` here first, in the caller's own session/thread, so
+        # workers only ever read already-materialized Python attributes
+        # instead of triggering a lazy-load against the wrong session.
+        for uop in getattr(user, "oui_positions", None) or []:
+            _ = uop.position.clearance if uop.position else None
+
+        from app.db.session import SessionLocal
+
+        def _run(query: str) -> list[dict]:
+            with SessionLocal() as thread_db:
+                return self.retrieve(
+                    query=query, user=user, top_k=top_k, mode=mode,
+                    oui_ids=oui_ids, chat_mode=chat_mode, db=thread_db,
+                )
+
+        with ThreadPoolExecutor(max_workers=min(len(queries), 8)) as executor:
+            per_query_results = list(executor.map(_run, queries))
+
+        merged: dict[str, dict] = {}
+        order: list[str] = []
+        for results in per_query_results:
+            for r in results:
+                cid = r.get("chunk_id")
+                if not cid:
+                    continue
+                if cid not in merged:
+                    merged[cid] = r
+                    order.append(cid)
+                elif (r.get("score") or 0) > (merged[cid].get("score") or 0):
+                    merged[cid] = r
+
+        return [merged[cid] for cid in order]
+
+
     # Retrieve from an arbitrary Chroma collection (e.g. gmail_chunks) filtered only by extra_where.
     def _retrieve_from_collection(
         self,
@@ -685,7 +762,74 @@ class RetrievalService:
                     r["doc_restricted"] = True
 
         results = self._post_filter_oui(results, oui_ids)
+        results = self._verify_content_signatures(results, db)
         return results[:top_k]
+
+    # Drop chunks belonging to a document_version whose stored signature no
+    # longer matches its current chunk content — i.e. rows changed directly
+    # in MySQL/Chroma, bypassing the app's upload/ingest flow entirely (see
+    # document_signing_service.py for the threat model this covers).
+    #
+    # Versions with no signature yet (content_signature IS NULL — ingested
+    # before this feature existed) are treated as unverifiable, not failed:
+    # this check only starts protecting a version once it has been (re-)
+    # ingested under the signing code path. It is not retroactive.
+    def _verify_content_signatures(self, results: list[dict], db) -> list[dict]:
+        if not results or db is None:
+            return results
+
+        version_ids = {
+            (r.get("metadata") or {}).get("document_version_id")
+            for r in results
+        }
+        version_ids.discard(None)
+        version_ids.discard("")
+        if not version_ids:
+            return results
+
+        verified: dict[str, bool] = {}
+        now = time.monotonic()
+        uncached_ids = []
+        for vid in version_ids:
+            cached = _signature_verify_cache.get(vid)
+            if cached is not None and cached[1] > now:
+                verified[vid] = cached[0]
+            else:
+                uncached_ids.append(vid)
+
+        if uncached_ids:
+            versions = db.query(DocumentVersion).filter(DocumentVersion.id.in_(uncached_ids)).all()
+            for version in versions:
+                if not version.content_signature:
+                    ok = True  # unsigned legacy version — not retroactively enforced
+                else:
+                    chunk_hashes = [
+                        row[0] for row in db.query(DocumentChunk.chunk_hash)
+                        .filter(DocumentChunk.document_version_id == version.id).all()
+                    ]
+                    current_hash = document_signing_service.compute_content_hash(chunk_hashes)
+                    ok = document_signing_service.verify(
+                        current_hash, version.content_signature, version.content_signature_key_id,
+                    )
+                    if not ok:
+                        logger.error(
+                            "CONTENT SIGNATURE MISMATCH version=%s doc=%s — chunk content changed "
+                            "outside the normal ingest flow; excluding from retrieval results",
+                            version.id, version.document_id,
+                        )
+                verified[version.id] = ok
+                _signature_verify_cache[version.id] = (ok, now + _SIGNATURE_CACHE_TTL_SECONDS)
+
+        return [
+            r for r in results
+            if verified.get((r.get("metadata") or {}).get("document_version_id"), True)
+        ]
+
+    # Called right after (re-)signing a version, so a legitimate re-ingest is
+    # reflected immediately instead of waiting out the cache TTL.
+    @staticmethod
+    def invalidate_signature_cache(version_id: str) -> None:
+        _signature_verify_cache.pop(version_id, None)
 
 
     # Return the highest clearance level across all of the user's OUI positions (1-5).
