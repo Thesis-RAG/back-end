@@ -136,6 +136,11 @@ services:
       PYTHONPATH: /app
     volumes:
       - openfga_config:/run/openfga:ro
+      # Shared with worker so both containers sign/verify with the SAME
+      # Ed25519 key (see app/services/document_signing_service.py) and it
+      # survives rebuilds/--force-recreate instead of regenerating per
+      # container, which would make every content_signature unverifiable.
+      - document_signing_key:/app/.secrets
     depends_on:
       mysql:
         condition: service_healthy
@@ -166,6 +171,7 @@ services:
       PYTHONPATH: /app
     volumes:
       - openfga_config:/run/openfga:ro
+      - document_signing_key:/app/.secrets
     depends_on:
       mysql:
         condition: service_healthy
@@ -211,3 +217,4 @@ volumes:
   openfga_config:
   neo4j_data:
   neo4j_logs:
+  document_signing_key:
