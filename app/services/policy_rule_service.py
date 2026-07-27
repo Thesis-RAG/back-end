@@ -106,14 +106,34 @@ def _scope_matches(pairs: list[dict] | None, user, expanded_oui_ids: set[str] | 
     return False
 
 
+# Top clearance (5) held across any of the user's OUI/Position assignments.
+# Mirrors the same max-across-assignments logic duplicated in
+# retrieval_service._get_user_clearance / document_access_requests._get_user_clearance
+# — kept as its own copy here rather than a shared import to avoid a new
+# cross-service dependency for one arithmetic loop.
+def _user_max_clearance(user) -> int:
+    max_c = 1
+    for assignment in getattr(user, "oui_positions", []) or []:
+        position = getattr(assignment, "position", None)
+        clearance = getattr(position, "clearance", None) if position else None
+        if clearance and clearance > max_c:
+            max_c = clearance
+    return max_c
+
+
 # Resolve the effective tier for one rule against one user.
-# Priority: allow > mask > block. block is the pure fallback — anyone
-# matching neither allow_scope nor mask_scope is hard-blocked, no appeal.
+# Priority: clearance-5 bypass > allow > mask > block. block is the pure
+# fallback — anyone matching neither allow_scope nor mask_scope is
+# hard-blocked, no appeal.
 #
 # expanded_oui_ids: pass the result of expand_oui_ids_via_graph(user), computed
 # once by the caller for the whole request, so a single chat turn costs at
 # most one graph round-trip regardless of how many entities/chunks it scores.
 def resolve_tier(rule: EntityPolicyRule, user, expanded_oui_ids: set[str] | None = None) -> dict:
+    # Top clearance bypasses entity policy entirely — always resolves full,
+    # regardless of allow/mask scope config or whether the rule is enabled.
+    if _user_max_clearance(user) >= 5:
+        return {"tier": "full"}
     if not rule.enabled:
         return {"tier": "block"}
     if _scope_matches(rule.allow_scope_pairs, user, expanded_oui_ids):

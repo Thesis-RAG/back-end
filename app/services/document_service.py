@@ -3,6 +3,7 @@ Service for document CRUD, versioning, FGA synchronisation, and ingest job manag
 """
 from __future__ import annotations
 
+import hashlib
 import logging
 from collections import defaultdict
 from pathlib import Path
@@ -29,6 +30,8 @@ from app.repositories.version_repository import VersionRepository
 from app.schemas.document import ChunkingConfig, DocumentCreateRequest, DocumentUpdateRequest
 from app.services.audit_service import audit_service
 from app.services.chroma_service import chroma_service
+from app.services.document_signing_service import document_signing_service
+from app.services.embedding_service import embedding_service
 from app.services.entity_extractor import compute_chunk_sensitivity
 from app.services.job_service import job_service
 from app.services.oui_tree_service import oui_tree_service
@@ -458,6 +461,179 @@ class DocumentService:
         return self.start_ingest(
             db, user, doc_id, version_id=version_id, force_new=True, trace_id=trace_id,
         )
+
+    # List chunks for a version, in reading order — backs the chunk-metadata editor.
+    def list_chunks(
+        self, db: Session, user: User, doc_id: str, version_id: str,
+    ) -> list[DocumentChunk]:
+        doc = self.docs.get_by_id(db, doc_id)
+        if not doc:
+            raise HTTPException(status_code=404, detail="Document not found")
+        ok, reason = self._can_view(db, user, doc)
+        if not ok:
+            raise HTTPException(status_code=403, detail=reason)
+        version = self.versions.get_by_id(db, version_id)
+        if not version or version.document_id != doc.id:
+            raise HTTPException(status_code=404, detail="Version not found")
+        return (
+            db.query(DocumentChunk)
+            .filter(DocumentChunk.document_version_id == version_id)
+            .order_by(DocumentChunk.chunk_index.asc())
+            .all()
+        )
+
+    # Edit a chunk's heading + text from the admin UI. Keeps MySQL, Chroma
+    # (re-embedded — a stale vector for edited text would silently break
+    # semantic search) and the version's content signature all in sync, so
+    # this legitimate edit isn't mistaken for the DB-tampering scenario
+    # document_signing_service is meant to catch (see its docstring) — that
+    # would silently drop every chunk of this version from retrieval on the
+    # very next query, not just the one just edited.
+    def update_chunk(
+        self, db: Session, user: User, doc_id: str, version_id: str, chunk_id: str,
+        *, section_heading: str, chunk_text: str, chunk_sensitivity: int = 2,
+    ) -> DocumentChunk:
+        doc = self.docs.get_by_id(db, doc_id)
+        if not doc:
+            raise HTTPException(status_code=404, detail="Document not found")
+        ok, reason = self._can_edit(db, user, doc)
+        if not ok:
+            raise HTTPException(status_code=403, detail=reason)
+        version = self.versions.get_by_id(db, version_id)
+        if not version or version.document_id != doc.id:
+            raise HTTPException(status_code=404, detail="Version not found")
+        chunk = db.get(DocumentChunk, chunk_id)
+        if not chunk or chunk.document_version_id != version_id:
+            raise HTTPException(status_code=404, detail="Chunk not found")
+
+        chunk_text = chunk_text.strip()
+        section_heading = section_heading.strip()
+        chunk_sensitivity = max(1, min(5, int(chunk_sensitivity or 2)))
+        if not chunk_text:
+            raise HTTPException(status_code=422, detail="Nội dung chunk không được để trống")
+
+        meta = dict(chunk.metadata_json or {})
+        meta["section_heading"] = section_heading
+        meta["chunk_sensitivity"] = chunk_sensitivity
+        chunk.chunk_text = chunk_text
+        chunk.metadata_json = meta
+        chunk.chunk_hash = hashlib.sha256(chunk_text.encode("utf-8")).hexdigest()
+        chunk.token_count = max(1, (len(chunk_text) + 3) // 4)
+        db.flush()
+
+        # embed_text mirrors _make_chunk_dict in chunker_service.py — heading
+        # prefixed onto the text, which is what both the embedding vector and
+        # Chroma's `document_text` (read back by BM25 at query time) are built
+        # from, so an edit here must go through the same shape or semantic/
+        # lexical search would silently diverge from the new content.
+        embed_text = f"{section_heading}\n\n{chunk_text}" if section_heading else chunk_text
+        vector = embedding_service.embed(embed_text)
+
+        existing_meta = chroma_service.get_metadatas_by_ids([chunk_id]).get(chunk_id) or {
+            "document_id": doc.id,
+            "document_version_id": version.id,
+            "document_title": doc.title,
+            "document_type": doc.document_type,
+            "sensitivity": doc.sensitivity,
+            "data_type": doc.data_type,
+            "chunk_index": chunk.chunk_index,
+            "page_start": chunk.page_start,
+            "page_end": chunk.page_end,
+            "section_index": meta.get("section_index", 0),
+            "position_ratio": meta.get("position_ratio", 0.0),
+            "chunker_mode": meta.get("chunker_mode", "legacy"),
+            "chunk_sensitivity": meta.get("chunk_sensitivity", doc.sensitivity),
+            "policy_profile": version.policy_profile,
+            "policy_version": version.policy_version,
+        }
+        existing_meta = dict(existing_meta)
+        existing_meta["section_heading"] = section_heading
+        existing_meta["chunk_hash"] = chunk.chunk_hash
+        existing_meta["chunk_sensitivity"] = chunk_sensitivity
+        chroma_service.upsert_chunk(
+            chunk_id=chunk_id,
+            document_text=embed_text,
+            embedding=vector,
+            metadata=existing_meta,
+        )
+
+        self._resign_version(db, version)
+        db.commit()
+        db.refresh(chunk)
+        return chunk
+
+    # Re-sign a version's content_hash/content_signature from its CURRENT set
+    # of chunk_hashes — call after any add/edit/delete of a chunk. Does not
+    # commit; caller commits alongside its own chunk changes in one
+    # transaction. See document_signing_service's docstring for the threat
+    # model this protects against — an edit that skips this step looks
+    # identical to DB tampering to the next retrieval query and silently
+    # drops every chunk of the version from search results.
+    def _resign_version(self, db: Session, version: DocumentVersion) -> None:
+        all_hashes = [
+            row[0] for row in db.query(DocumentChunk.chunk_hash)
+            .filter(DocumentChunk.document_version_id == version.id).all()
+        ]
+        content_hash = document_signing_service.compute_content_hash(all_hashes)
+        signature_b64, key_id, signed_at = document_signing_service.sign(content_hash)
+        version.content_hash = content_hash
+        version.content_signature = signature_b64
+        version.content_signature_key_id = key_id
+        version.content_signed_at = signed_at
+        db.flush()
+
+        from app.services.retrieval_service import retrieval_service
+        retrieval_service.invalidate_signature_cache(version.id)
+
+    # Delete a single chunk from a version — removes it from Chroma + MySQL,
+    # renumbers the remaining chunks' chunk_index/position_ratio (both in
+    # MySQL and mirrored into Chroma metadata) so they stay a contiguous
+    # 0..N-1 sequence with no gap, and re-signs the version's content hash.
+    def delete_chunk(
+        self, db: Session, user: User, doc_id: str, version_id: str, chunk_id: str,
+    ) -> list[DocumentChunk]:
+        doc = self.docs.get_by_id(db, doc_id)
+        if not doc:
+            raise HTTPException(status_code=404, detail="Document not found")
+        ok, reason = self._can_edit(db, user, doc)
+        if not ok:
+            raise HTTPException(status_code=403, detail=reason)
+        version = self.versions.get_by_id(db, version_id)
+        if not version or version.document_id != doc.id:
+            raise HTTPException(status_code=404, detail="Version not found")
+        chunk = db.get(DocumentChunk, chunk_id)
+        if not chunk or chunk.document_version_id != version_id:
+            raise HTTPException(status_code=404, detail="Chunk not found")
+
+        chroma_service.delete_chunks([chunk_id])
+        db.delete(chunk)  # cascades to ChunkEmbedding (see DocumentChunk.embeddings)
+        db.flush()
+
+        remaining = (
+            db.query(DocumentChunk)
+            .filter(DocumentChunk.document_version_id == version_id)
+            .order_by(DocumentChunk.chunk_index.asc())
+            .all()
+        )
+        total = len(remaining)
+        for new_idx, c in enumerate(remaining):
+            new_ratio = round(new_idx / max(1, total), 4)
+            if c.chunk_index == new_idx and (c.metadata_json or {}).get("position_ratio") == new_ratio:
+                continue
+            meta = dict(c.metadata_json or {})
+            meta["position_ratio"] = new_ratio
+            c.chunk_index = new_idx
+            c.metadata_json = meta
+            chroma_service.update_document_metadata(
+                [c.id], {"chunk_index": new_idx, "position_ratio": new_ratio},
+            )
+        db.flush()
+
+        self._resign_version(db, version)
+        db.commit()
+        for c in remaining:
+            db.refresh(c)
+        return remaining
 
     # Delete a document and all its associated versions, chunks, jobs, and FGA tuples.
     def delete_document(self, db: Session, user: User, doc_id: str, trace_id: str) -> None:

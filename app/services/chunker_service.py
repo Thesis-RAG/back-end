@@ -581,8 +581,29 @@ Bước 1 — Liệt kê TRƯỚC: Đọc toàn bộ tài liệu, liệt kê dan
   và phải được gộp vào chunk của đề mục cha đó.
   Nếu một đề mục cấp cao không có nội dung văn bản riêng (chỉ là tiêu đề nhóm),
   không đưa vào checklist. Đây là checklist bạn phải hoàn thành ở Bước 3.
-Bước 2 — Xác định entity: Tìm các entity chính (tên người, tổ chức, mã số,
-  mã hợp đồng...) để gắn vào section_heading.
+Bước 2 — Xác định entity: Với MỖI chunk, xác định 1 thực thể LIÊN QUAN
+  NHẤT — chủ thể mà nội dung tài liệu NÓI VỀ/ÁP DỤNG CHO (có thể là một cá
+  nhân, một dự án, một đề xuất, một giao dịch/hợp đồng...). Entity không
+  cần xuất hiện trong chính văn bản chunk, miễn đọc "heading + chunk_text"
+  là hiểu ngay đang nói về ai/cái gì, không cần xem chunk khác. 
+  Ưu tiên lấy càng đầy đủ, càng nhiều, càng chi tiết càng tốt.
+  Phần lớn các trường hợp thì thực thể đó sẽ nằm ở đầu văn bản, như là 1 tiêu đề chung.
+  - Tài liệu xoay quanh 1 cá nhân (hợp đồng lao động, hồ sơ nhân viên...):
+    dùng tên người đó cho MỌI chunk, kể cả điều khoản chung không nhắc
+    lại tên — vì cả tài liệu áp dụng riêng cho người đó.
+  - Tài liệu về 1 giao dịch/dự án/hợp đồng/đề xuất/... (không xoay quanh 1 cá nhân):
+    dùng TRỌN VẸN tên riêng/dự án/hợp đồng/đề xuất đó, lấy hết tới hết
+    cụm danh từ riêng — KHÔNG dừng giữa chừng ở loại văn bản chung chung
+    hay ở dấu ngoặc. Ví dụ tiêu đề "HỢP ĐỒNG KINH TẾ VỀ VIỆC XÂY DỰNG HỆ
+    THỐNG QUẢN LÝ HỌC TẬP TRỰC TUYẾN (LMS) TƯƠNG LAI VIỆT": lấy TRỌN "Hợp đồng kinh tế 
+    về việc xây dựng Hệ thống quản lý học tập trực tuyến (LMS) Tương Lai Việt" - không dừng ở
+    "Hợp đồng kinh tế" (chỉ là loại văn bản) hay "Hệ thống quản lý học tập"
+    (cắt cụt trước phần tên riêng "Tương Lai Việt" mới là phần phân biệt
+    được tài liệu này với các hợp đồng kinh tế khác). KHÔNG dùng tên một
+    bên chỉ được nhắc tới bên trong nội dung.
+  - Bẫy cần tránh: các trường "Người lập/soạn thảo/sở hữu/phê duyệt" chỉ
+    cho biết ai TẠO ra văn bản, hầu như không bao giờ là entity — trừ khi
+    chính người đó cũng là chủ thể nội dung (vd hồ sơ của chính họ).
 Bước 3 — Chunk theo checklist: Với MỖI đề mục đã liệt kê ở Bước 1, tạo ra
   ít nhất 1 chunk tương ứng. Mỗi chunk PHẢI bao gồm toàn bộ nội dung của đề mục
   đó, KỂ CẢ tất cả các mục con X.Y của nó (ví dụ: chunk "Điều 6" phải chứa
@@ -593,10 +614,11 @@ Bước 4 — Tự kiểm tra: Trước khi trả kết quả, đối chiếu l�
   ở Bước 3 không? Nếu thiếu, PHẢI bổ sung chunk còn thiếu trước khi trả JSON.
 
 Quy tắc đặt section_heading:
-- Luôn gắn entity chính vào heading, kể cả khi chunk đó không nhắc lại tên
-- Format: "[Tên entity chính của chunk] - [Loại thông tin]"
-- Ví dụ: "Nguyễn Hoàng Minh - Thông tin cá nhân", "Hợp đồng HĐ-2024-001 - Điều khoản thanh toán"
-- Nếu chunk không có entity rõ ràng, dùng tên đề mục gốc (ví dụ "Chương 5 - Điều chỉnh vận hành vốn")
+- Format: "[Entity từ Bước 2] - [Mô tả ngắn nội dung riêng của chunk này]"
+- Mô tả phải ngắn gọn (vài từ), không lặp nguyên văn tên đề mục gốc.
+- Ví dụ: "Nguyễn Văn An - Hợp đồng lương", "Dự án nâng cấp hạ tầng ERP -
+  Kế hoạch triển khai", "HĐ-2024-001 - Điều khoản thanh toán".
+- Không xác định được entity rõ ràng: dùng tên đề mục gốc (vd "Chương 5 - Điều chỉnh vận hành vốn").
 
 Quy tắc chunk:
 - Chunk phải self-contained: đọc riêng vẫn hiểu được, không cần context bên ngoài
@@ -731,6 +753,12 @@ def _chunk_with_llm(parsed: ParsedDocument, cfg: ChunkConfig, doc_sensitivity: i
     if not items:
         raise RuntimeError("LLM chunker trả về 0 chunks")
 
+    outline = data.get("outline_checklist") if isinstance(data, dict) else None
+    print(f"[LLM-CHUNKER] outline_checklist ({len(outline or [])}): {outline}")
+    print(f"[LLM-CHUNKER] raw section_heading per chunk ({len(items)}):")
+    for idx, item in enumerate(items):
+        print(f"  [{idx}] {item.get('section_heading')!r}")
+
     total_pages = max(1, len(parsed.pages))
     results: list[dict] = []
 
@@ -773,6 +801,10 @@ def _chunk_with_llm(parsed: ParsedDocument, cfg: ChunkConfig, doc_sensitivity: i
             mode="llm_structured",
             sensitivity=doc_sensitivity,
         ))
+
+    print(f"[LLM-CHUNKER] final section_heading per persisted chunk ({len(results)}):")
+    for r in results:
+        print(f"  [{r['chunk_index']}] {r['metadata_json']['section_heading']!r}")
 
     return results
 

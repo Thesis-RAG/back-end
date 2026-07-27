@@ -16,6 +16,7 @@ DEFAULTS: dict[str, Any] = {
     "rag.top_k": 5,
     "rag.similarity_threshold": 0.0,
     "rag.hybrid_search": True,
+    "rag.rerank_enabled": True,
     "query_scope_mode": "full_db",
     "llm.provider": None,
     "llm.chat_model": None,

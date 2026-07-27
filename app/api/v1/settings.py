@@ -55,6 +55,7 @@ def update_settings(
         "rag.top_k",
         "rag.similarity_threshold",
         "rag.hybrid_search",
+        "rag.rerank_enabled",
         "query_scope_mode",
         "llm.provider",
         "llm.chat_model",
