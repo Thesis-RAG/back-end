@@ -124,6 +124,35 @@ class UploadVersionResponse(BaseModel):
     queued: bool
 
 
+class DocumentChunkRead(BaseModel):
+    model_config = ConfigDict(from_attributes=True)
+
+    id: str
+    document_version_id: str
+    chunk_index: int
+    chunk_text: str
+    section_heading: str = ""
+    chunk_sensitivity: int = 2
+    page_start: Optional[int] = None
+    page_end: Optional[int] = None
+    updated_at: datetime
+
+    @classmethod
+    def model_validate(cls, obj, **kwargs):
+        data = super().model_validate(obj, **kwargs)
+        if hasattr(obj, "metadata_json"):
+            meta = obj.metadata_json or {}
+            data.section_heading = meta.get("section_heading") or ""
+            data.chunk_sensitivity = int(meta.get("chunk_sensitivity") or 2)
+        return data
+
+
+class DocumentChunkUpdate(BaseModel):
+    section_heading: str = Field(default="", max_length=500)
+    chunk_text: str = Field(..., min_length=1)
+    chunk_sensitivity: int = Field(default=2, ge=1, le=5)
+
+
 class PolicySnapshotRead(BaseModel):
     model_config = ConfigDict(from_attributes=True)
 

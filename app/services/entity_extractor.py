@@ -39,16 +39,92 @@ REGEX_PATTERNS: dict[str, re.Pattern] = {
         r"(?:số BHXH|số sổ BHXH)[:\s]*?([A-Z]{2}\d{8,12}|\d{8,12})", re.IGNORECASE
     ),
     "bank_account": re.compile(r"(?:tài khoản|TK)[^\d]{0,20}(\d{9,16})", re.IGNORECASE),
-    "dob": re.compile(
+    "birth_date": re.compile(
         r"(?:ngày sinh|sinh ngày|DOB)[:\s]*?(\d{1,2}/\d{1,2}/\d{2,4})", re.IGNORECASE
     ),
-    "date_generic": re.compile(r"\b\d{1,2}/\d{1,2}/\d{2,4}\b"),
-    "money": re.compile(r"\b[\d.,]+\s?(?:VND|đồng|VNĐ)\b", re.IGNORECASE),
     "percentage": re.compile(r"\b\d{1,3}\s?%"),
     "credential": re.compile(
         r"(?i)\b(?:password|mật khẩu|api[_\s-]?key|token|secret|otp)\b\s*[:=]\s*[^\s,;]+"
     ),
 }
+
+# No regex-detected "money" type anymore — deliberately not in
+# REGEX_PATTERNS, so Layer 1 never emits a "money" entity on its own.
+# Money-shaped numbers are found ONLY to annotate them for GLiNER (below);
+# whatever label (money/salary/revenue/bonus/financial_data/...) actually
+# gets applied is entirely GLiNER's zero-shot call over the active policy
+# label set, not a hardcoded regex classification.
+_MONEY_SHAPE_RE = re.compile(
+    r"\b[\d.,]+\s?(?:VND|đồng|VNĐ)\b|\b\d{1,3}(?:\.\d{3}){2,}\b", re.IGNORECASE
+)
+
+# ── Money-hint annotation for GLiNER (query-time only) ────────────────────────
+# GLiNER's zero-shot scoring leans heavily on nearby lexical context — a bare
+# grouped number ("22.000.000") reads far more ambiguously to it than the
+# same number written "22.000.000 $" does. The hint doesn't need to be the
+# real currency — it's never stored, embedded, or shown to anyone
+# (chunk_text/document_text handed to the LLM and the sources panel always
+# stay the original, unannotated string), so the only thing that matters is
+# picking whatever token GLiNER's own training data associates MOST
+# strongly and unambiguously with "this is a monetary amount". "$" is about
+# as globally common a money marker as text gets, likely a stronger signal
+# than a VNĐ-specific token for a multilingual zero-shot model. Swap freely
+# if empirical testing finds a different token scores better.
+#
+# Detected span offsets come back in annotated-text coordinates and are
+# mapped onto the original text (via _remap_offset) before anything else
+# touches them, so masking still edits the real chunk, not the hint.
+_MONEY_HINT = " $"
+
+
+def _annotate_bare_money(text: str) -> tuple[str, list[tuple[int, int]]]:
+    if not text:
+        return text, []
+    insertions: list[tuple[int, int]] = []
+    pieces: list[str] = []
+    cursor = 0
+    for m in _MONEY_SHAPE_RE.finditer(text):
+        matched = m.group(0)
+        if matched[-1].isalpha():
+            continue  # already ends in a unit (VND/đồng/VNĐ) — no hint needed
+        pieces.append(text[cursor:m.end()])
+        pieces.append(_MONEY_HINT)
+        insertions.append((m.end(), len(_MONEY_HINT)))
+        cursor = m.end()
+    if not insertions:
+        return text, []
+    pieces.append(text[cursor:])
+    return "".join(pieces), insertions
+
+
+# Translate a span offset found in annotated-text coordinates back onto the
+# original (pre-annotation) text, given the insertions _annotate_bare_money
+# recorded (each: original-text position -> length of hint spliced in there).
+def _remap_offset(annotated_pos: int, insertions: list[tuple[int, int]]) -> int:
+    shift = 0
+    for orig_pos, length in insertions:
+        if annotated_pos >= orig_pos + shift + length:
+            shift += length
+        else:
+            break
+    return annotated_pos - shift
+
+
+def _remap_entity_span(entity: dict, insertions: list[tuple[int, int]], original_text: str) -> None:
+    if not insertions:
+        return
+    try:
+        start, end = int(entity.get("start", 0)), int(entity.get("end", 0))
+    except (TypeError, ValueError):
+        return
+    new_start = max(0, min(_remap_offset(start, insertions), len(original_text)))
+    new_end = max(new_start, min(_remap_offset(end, insertions), len(original_text)))
+    entity["start"] = new_start
+    entity["end"] = new_end
+    # GLiNER's own "text" may include the synthetic hint (eg matched
+    # "22.000.000 VNĐ") — replace it with the real substring at the
+    # remapped, original-text position.
+    entity["text"] = original_text[new_start:new_end]
 
 # ── Builtin flags for regex-detected entity types ─────────────────────────────
 # These types are captured by Layer 1 regex patterns (not from DB domains),
@@ -62,7 +138,6 @@ _BUILTIN_ENTITY_FLAGS: dict[str, list[str]] = {
     "social_insurance": ["has_pii", "has_hr"],
     "bank_account":     ["has_pii", "has_financial"],
     "dob":              ["has_pii", "has_hr"],
-    "money":            ["has_financial"],
     "percentage":       ["has_financial"],
     "date_generic":     [],
     "credential":       ["has_credential"],
@@ -79,6 +154,7 @@ _DEFAULT_GLINER_FLAGS: dict[str, list[str]] = {
     "person_name": ["has_pii"],
     "address": ["has_pii"],
     "salary": ["has_financial", "has_hr"],
+    "money": ["has_financial"],
     "project": ["has_strategic"],
     "contract": ["has_legal"],
     "account_number": ["has_pii", "has_financial"],
@@ -243,16 +319,22 @@ def extract_structured_entities(text: str, allowed_labels: set[str] | None = Non
 # ── Layer 2: GLiNER extraction ────────────────────────────────────────────────
 
 # Extract free-text entities using GLiNER with the given label list (Layer 2).
+# Money-hint annotated (see _annotate_bare_money) so ingest-time detection
+# (run_pipeline) gets the same VNĐ-context boost as query-time — without
+# this, removing the regex "money" pattern would leave ingest-time
+# chunk_sensitivity scoring blind to bare numeric amounts entirely.
 def extract_freetext_entities(text: str, labels: list[str], threshold: float = 0.3) -> list[dict]:
     if not labels:
         return []
     model = _get_gliner()
     if model is None:
         return []
+    annotated, insertions = _annotate_bare_money(text)
     try:
-        raw = model.predict_entities(text, labels, threshold=threshold)
+        raw = model.predict_entities(annotated, labels, threshold=threshold)
         for e in raw:
             e["source"] = "gliner"
+            _remap_entity_span(e, insertions, text)
         return raw
     except Exception as exc:
         logger.error("GLiNER inference error: %s", exc)
@@ -315,6 +397,35 @@ def _batch_predict(model, texts: list[str], labels: list[str], threshold: float)
     return [model.predict_entities(text, labels, threshold=threshold) for text in texts]
 
 
+# Cap on distinct per-text label subsets extract_realtime_batch_detailed will
+# honor (see per_text_labels below) before collapsing back to one shared
+# label list for the whole batch. Each distinct group costs its own
+# _batch_predict call — on CPU (no GPU configured in this deployment) the
+# fixed per-call overhead _batch_predict's docstring warns about (tokenize/
+# collate/eval/dispatch) adds up fast if every text ends up in its own
+# group, which would silently re-create the "one model call per chunk"
+# latency problem batching was introduced to avoid.
+_MAX_LABEL_GROUPS = 4
+
+
+# Bucket text indices by identical relevant-label subset (order-independent —
+# {"a","b"} and {"b","a"} are the same group) so callers that narrowed
+# GLiNER's active labels per-text (eg an LLM pre-filter step) still get one
+# _batch_predict call per distinct subset instead of per text. Falls back to
+# a single group covering the union of every subset once there are more than
+# _MAX_LABEL_GROUPS distinct ones, trading exact per-text filtering for
+# bounded latency.
+def _group_by_labels(per_text_labels: list[list[str]]) -> list[tuple[list[str], list[int]]]:
+    groups: dict[tuple[str, ...], list[int]] = {}
+    for index, labels in enumerate(per_text_labels):
+        key = tuple(sorted(set(labels)))
+        groups.setdefault(key, []).append(index)
+    if len(groups) > _MAX_LABEL_GROUPS:
+        union = sorted({label for labels in per_text_labels for label in labels})
+        return [(union, list(range(len(per_text_labels))))]
+    return [(list(key), indices) for key, indices in groups.items()]
+
+
 # Run GLiNER on multiple texts in one batched forward pass.
 # Returns one set[str] of detected entity types per text.
 def extract_realtime_batch(
@@ -346,12 +457,20 @@ def extract_realtime_batch_detailed(
     db=None,
     threshold: float = 0.3,
     labels: list[str] | set[str] | None = None,
+    per_text_labels: list[list[str]] | None = None,
 ) -> list[dict]:
     """Return structured entities, GLiNER entities, types and boolean flags.
 
     Policy enforcement needs spans, not just a set of labels, in order to mask
     only the salary/PII field inside a mixed chunk.  This keeps the existing
     lightweight batch API intact and adds a detailed variant for that path.
+
+    per_text_labels: optional, one relevant-label subset per text (same
+    length/order as `texts`) — eg from an upstream LLM topic-filter — used to
+    narrow GLiNER's active labels per text instead of running every text
+    against the full `labels`/cache list. Grouped via _group_by_labels so
+    texts sharing a subset still batch together; ignored (falls back to the
+    single shared list) if its length doesn't match `texts`.
     """
     if not texts:
         return []
@@ -359,21 +478,47 @@ def extract_realtime_batch_detailed(
         sorted(set(labels)), _refresh_cache(db)[1]
     )
     model = _get_gliner() if gliner_labels else None
+    allowed_labels = set(gliner_labels)
+
+    # Annotated-for-GLiNER copies only — never used for regex, never
+    # returned/stored (see _annotate_bare_money's docstring above).
+    annotated_texts: list[str] = []
+    insertions_by_text: list[list[tuple[int, int]]] = []
+    for t in texts:
+        annotated, insertions = _annotate_bare_money(t)
+        annotated_texts.append(annotated)
+        insertions_by_text.append(insertions)
 
     # One batched GLiNER call across all chunks (see _batch_predict), then a
     # cheap per-text loop for regex extraction + assembly.
     freetext_by_text: list[list[dict]] = [[] for _ in texts]
     if model is not None:
         try:
-            batched = _batch_predict(model, texts, gliner_labels, threshold)
-            for i, freetext in enumerate(batched):
-                for entity in freetext:
-                    entity["source"] = "gliner"
-                freetext_by_text[i] = freetext
+            if per_text_labels is not None and len(per_text_labels) == len(texts):
+                for group_labels, indices in _group_by_labels(per_text_labels):
+                    # A per-text subset may reference labels that are no
+                    # longer active/valid (eg from a stale LLM suggestion) —
+                    # clip to what GLiNER is actually allowed to look for.
+                    group_labels = [label for label in group_labels if label in allowed_labels]
+                    if not group_labels:
+                        continue
+                    group_texts = [annotated_texts[i] for i in indices]
+                    batched = _batch_predict(model, group_texts, group_labels, threshold)
+                    for i, freetext in zip(indices, batched):
+                        for entity in freetext:
+                            entity["source"] = "gliner"
+                            _remap_entity_span(entity, insertions_by_text[i], texts[i])
+                        freetext_by_text[i] = freetext
+            else:
+                batched = _batch_predict(model, annotated_texts, gliner_labels, threshold)
+                for i, freetext in enumerate(batched):
+                    for entity in freetext:
+                        entity["source"] = "gliner"
+                        _remap_entity_span(entity, insertions_by_text[i], texts[i])
+                    freetext_by_text[i] = freetext
         except Exception as exc:
             logger.debug("GLiNER batched detailed extraction failed: %s", exc)
 
-    allowed_labels = set(gliner_labels)
     results: list[dict] = []
     for text, freetext in zip(texts, freetext_by_text):
         structured = extract_structured_entities(text, allowed_labels)

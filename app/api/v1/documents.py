@@ -18,6 +18,8 @@ from app.repositories.document_access_request_repository import doc_access_reque
 from app.repositories.storage_repository import StorageRepository
 from app.schemas.document import (
     ChunkingConfig,
+    DocumentChunkRead,
+    DocumentChunkUpdate,
     DocumentCreateRequest,
     DocumentRead,
     DocumentUpdateRequest,
@@ -255,6 +257,61 @@ def view_document_file(
             "Access-Control-Expose-Headers": "Content-Disposition",
         },
     )
+
+
+# List chunks (heading + text) for a version — backs the chunk-metadata editor.
+@router.get("/{document_id}/versions/{version_id}/chunks", response_model=list[DocumentChunkRead])
+def list_document_chunks(
+    document_id: str,
+    version_id: str,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    chunks = document_service.list_chunks(db, current_user, document_id, version_id)
+    return [DocumentChunkRead.model_validate(c) for c in chunks]
+
+
+# Edit a chunk's section_heading + chunk_text. Re-embeds into Chroma and
+# re-signs the version's content signature so the edit is fully applied
+# everywhere retrieval reads from (see document_service.update_chunk).
+@router.put(
+    "/{document_id}/versions/{version_id}/chunks/{chunk_id}",
+    response_model=DocumentChunkRead,
+)
+def update_document_chunk(
+    document_id: str,
+    version_id: str,
+    chunk_id: str,
+    payload: DocumentChunkUpdate,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    chunk = document_service.update_chunk(
+        db, current_user, document_id, version_id, chunk_id,
+        section_heading=payload.section_heading, chunk_text=payload.chunk_text,
+        chunk_sensitivity=payload.chunk_sensitivity,
+    )
+    return DocumentChunkRead.model_validate(chunk)
+
+
+# Delete a chunk — removes it from Chroma + MySQL, renumbers the remaining
+# chunks' chunk_index/position_ratio, and returns the updated chunk list
+# (see document_service.delete_chunk).
+@router.delete(
+    "/{document_id}/versions/{version_id}/chunks/{chunk_id}",
+    response_model=list[DocumentChunkRead],
+)
+def delete_document_chunk(
+    document_id: str,
+    version_id: str,
+    chunk_id: str,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    remaining = document_service.delete_chunk(
+        db, current_user, document_id, version_id, chunk_id,
+    )
+    return [DocumentChunkRead.model_validate(c) for c in remaining]
 
 
 # Submit a document for corp-level review, or auto-approve if caller is a corp member.

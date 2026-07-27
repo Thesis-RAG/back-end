@@ -27,6 +27,15 @@ logger = logging.getLogger(__name__)
 
 # RRF constant – higher k → smoother ranking (less sensitive to top ranks)
 _RRF_K = 60
+
+# Cross-encoder reranking is O(n) full-transformer forward passes on CPU —
+# scoring every RRF candidate (often 30-40) wastes >80% of that compute since
+# only top_k is ever returned. Cap the pool fed into the reranker instead.
+# max(..., top_k * 2) keeps a 2x buffer for rerank to reorder within even if
+# rag.top_k is ever configured above the default (no upper bound enforced
+# where it's read — see app/api/v1/settings.py), so the pool never shrinks
+# below what's actually requested downstream.
+_RERANK_MIN_CANDIDATES = 10
 GMAIL_CHROMA_COLLECTION = "gmail_chunks"
 
 # Content-signature verification cache: re-hashing every chunk of a version
@@ -411,6 +420,17 @@ class RetrievalService:
                 return None
         return self._reranker
 
+    # Runtime on/off switch for RWSS (rag.rerank_enabled system setting),
+    # separate from settings.reranker_enabled which is the static ops-level
+    # kill switch checked inside _rerank_after_rrf/_get_reranker. Without a
+    # db session (e.g. collection helpers called without one) fall back to
+    # the static setting.
+    def _is_rerank_enabled(self, db) -> bool:
+        if db is None:
+            return bool(settings.reranker_enabled)
+        from app.repositories.system_setting_repository import system_setting_repository
+        return bool(system_setting_repository.get(db, "rag.rerank_enabled"))
+
     def _rerank_after_rrf(
         self,
         query: str,
@@ -514,6 +534,7 @@ class RetrievalService:
                 extra_where={"user_id": {"$eq": user_id}} if user_id else None,
                 semantic_candidates=40,
                 lexical_candidates=40,
+                db=db,
             )
         elif chat_mode == "all":
             rag_results = self._retrieve_main(query=query, user=user, top_k=top_k, oui_ids=oui_ids, db=db)
@@ -521,6 +542,7 @@ class RetrievalService:
                 query=query, user=user, top_k=top_k,
                 collection_name=GMAIL_CHROMA_COLLECTION,
                 extra_where={"user_id": {"$eq": user_id}} if user_id else None,
+                db=db,
             )
             merged = rag_results + gmail_results
             merged.sort(key=lambda x: x.get("score", 0), reverse=True)
@@ -605,6 +627,7 @@ class RetrievalService:
         mode: str = "hybrid",
         semantic_candidates: int | None = None,
         lexical_candidates: int | None = None,
+        db=None,
     ) -> list[dict]:
         where = extra_where
         sem_k = semantic_candidates or self.semantic_candidates
@@ -662,11 +685,22 @@ class RetrievalService:
                 "sources": item.get("sources", []),
             })
 
-        results = self._rerank_after_rrf(
-            query, results, user_clearance=self._get_user_clearance(user)
-        )
+        # results is still in RRF-rank order here (fused was sorted, and the
+        # loop above only drops items below minimum_score).
+        if self._is_rerank_enabled(db):
+            rerank_pool = max(_RERANK_MIN_CANDIDATES, top_k * 2)
+            results = results[:rerank_pool]
+
+            _rwss_start = time.perf_counter()
+            results = self._rerank_after_rrf(
+                query, results, user_clearance=self._get_user_clearance(user)
+            )
+            _rwss_elapsed = time.perf_counter() - _rwss_start
+            print(f"[RWSS] query={query[:80]!r} candidates={len(results)} elapsed={_rwss_elapsed:.3f}s")
+        else:
+            print(f"[RWSS] disabled (rag.rerank_enabled=false) — plain RRF order query={query[:80]!r} candidates={len(results)}")
         return results[:top_k]
-    
+
 
     # Retrieve from the main document_chunks collection with FGA gating and clearance-based blurring.
     def _retrieve_main(
@@ -876,7 +910,20 @@ class RetrievalService:
 
         results = self._post_filter_oui(results, oui_ids)
         results = self._verify_content_signatures(results, db)
-        results = self._rerank_after_rrf(query, results, user_clearance=user_clearance)
+
+        # results is still in RRF-rank order here (post_filter_oui and
+        # _verify_content_signatures only drop items, never reorder).
+        if self._is_rerank_enabled(db):
+            rerank_pool = max(_RERANK_MIN_CANDIDATES, top_k * 2)
+            results = results[:rerank_pool]
+
+            _rwss_start = time.perf_counter()
+            results = self._rerank_after_rrf(query, results, user_clearance=user_clearance)
+            _rwss_elapsed = time.perf_counter() - _rwss_start
+            print(f"[RWSS] query={query[:80]!r} candidates={len(results)} elapsed={_rwss_elapsed:.3f}s")
+        else:
+            print(f"[RWSS] disabled (rag.rerank_enabled=false) — plain RRF order query={query[:80]!r} candidates={len(results)}")
+
         return results[:top_k]
 
     # Drop chunks belonging to a document_version whose stored signature no

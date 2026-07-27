@@ -28,6 +28,43 @@ CATEGORIES = {
     "Policy", "Scope", "Permission", "Decision",
 }
 
+# (from_category, to_category) -> the REL_TYPEs meaningful in that exact
+# direction — derived from every edge pattern the app itself actually
+# produces (ontology_sync_service.py forward sync + seed_ontology.py static
+# taxonomy), not an abstract "anything goes" list. Used to (a) narrow the
+# relationship-type picker in the graph UI to only what makes sense for the
+# two selected nodes, and (b) reject the create call server-side if the
+# client sends a combination that isn't here.
+#
+# PARTICIPATES_IN and ATTENDS are declared in REL_TYPES but never actually
+# constructed anywhere in the codebase — deliberately absent below, since
+# there's no real pattern to derive a valid pair from. Employee never
+# appears as a target and Decision never appears as a source in any real
+# edge (both are semantic dead-ends by design: Decision is a terminal
+# outcome, Employee/user_assignment nodes only ever point outward) — so no
+# pair has Employee-as-target or Decision-as-source either.
+VALID_REL_PAIRS: dict[tuple[str, str], set[str]] = {
+    ("Document", "Document"):         {"IS_A"},
+    ("Entity", "Entity"):             {"IS_A"},
+    ("Policy", "Policy"):             {"IS_A"},
+    ("Scope", "Scope"):               {"IS_A"},
+    ("Permission", "Permission"):     {"IS_A"},
+    ("Organization", "Organization"): {"IS_A", "BELONGS_TO"},
+    ("Organization", "Scope"):        {"IS_A"},
+    ("Scope", "Organization"):        {"IS_A_ROLE_OF"},
+    ("Employee", "Scope"):            {"IS_A"},
+    ("Permission", "Decision"):       {"RESULTS_IN"},
+    ("Entity", "Policy"):             {"PROTECTED_BY"},
+    ("Policy", "Permission"):         {"GRANTS"},
+    ("Policy", "Scope"):              {"APPLIES_TO"},
+    ("Policy", "Organization"):       {"APPLIES_TO"},
+    ("Document", "Entity"):           {"CONTAINS"},
+}
+
+
+def valid_rel_types_for(from_category: str, to_category: str) -> list[str]:
+    return sorted(VALID_REL_PAIRS.get((from_category, to_category), set()))
+
 
 def _clean_props(props: dict) -> dict:
     result = dict(props)
@@ -38,7 +75,16 @@ def _clean_props(props: dict) -> dict:
 
 
 def get_meta() -> dict:
-    return {"relTypes": sorted(REL_TYPES), "categories": sorted(CATEGORIES)}
+    return {
+        "relTypes": sorted(REL_TYPES),
+        "categories": sorted(CATEGORIES),
+        # Flat list form (not a dict keyed by "From|To") so it survives
+        # JSON transport unambiguously regardless of client language.
+        "validPairs": [
+            {"from": frm, "to": to, "relTypes": sorted(rels)}
+            for (frm, to), rels in sorted(VALID_REL_PAIRS.items())
+        ],
+    }
 
 
 def get_graph() -> dict:
@@ -121,8 +167,35 @@ def create_relationship(db: Session, from_id: str, to_id: str, rel_type: str) ->
         raise ValueError("fromId, toId, relType là bắt buộc")
     if rel_type not in REL_TYPES:
         raise ValueError(f"relType không hợp lệ. Cho phép: {', '.join(sorted(REL_TYPES))}")
+
     rel_id = str(uuid.uuid4())
     with get_neo4j_session() as session:
+        categories = session.run(
+            """
+            MATCH (a:OntologyNode {id: $fromId}), (b:OntologyNode {id: $toId})
+            RETURN a.category AS fromCategory, b.category AS toCategory
+            """,
+            fromId=from_id, toId=to_id,
+        ).single()
+        if categories is None:
+            raise LookupError("Không tìm thấy node nguồn hoặc đích")
+
+        # Server-side authority: the client (EditPanel.tsx) already narrows
+        # its dropdown to validPairs from get_meta(), but that's UX only —
+        # this is what actually rejects a mismatched pair, so it can't be
+        # bypassed by calling the API directly.
+        allowed = valid_rel_types_for(categories["fromCategory"], categories["toCategory"])
+        if rel_type not in allowed:
+            if allowed:
+                raise ValueError(
+                    f"'{categories['fromCategory']}' → '{categories['toCategory']}' chỉ chấp nhận: "
+                    f"{', '.join(allowed)}. Chọn lại 2 node hoặc đổi loại quan hệ."
+                )
+            raise ValueError(
+                f"Không có quan hệ hợp lý nào giữa '{categories['fromCategory']}' và "
+                f"'{categories['toCategory']}'. Vui lòng chọn lại 2 node khác."
+            )
+
         result = session.run(
             f"""
             MATCH (a:OntologyNode {{id: $fromId}}), (b:OntologyNode {{id: $toId}})
