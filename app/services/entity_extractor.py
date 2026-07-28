@@ -318,6 +318,21 @@ def extract_structured_entities(text: str, allowed_labels: set[str] | None = Non
 
 # ── Layer 2: GLiNER extraction ────────────────────────────────────────────────
 
+# GLiNER is a zero-shot NER model trained against natural-language label
+# prompts ("employee salary"), not snake_case identifiers ("employee_salary")
+# — the underscore is an odd token that hurts its label embedding quality.
+# entity_key stays snake_case everywhere else in this module (DB matching,
+# entity_flags lookup, allowed_labels/per_text_labels comparisons) — this
+# conversion only wraps the actual model call, converted back on the way out
+# so no downstream code ever sees the space form.
+def _to_gliner_prompt(label: str) -> str:
+    return label.replace("_", " ")
+
+
+def _from_gliner_prompt(label: str) -> str:
+    return label.replace(" ", "_")
+
+
 # Extract free-text entities using GLiNER with the given label list (Layer 2).
 # Money-hint annotated (see _annotate_bare_money) so ingest-time detection
 # (run_pipeline) gets the same VNĐ-context boost as query-time — without
@@ -331,8 +346,9 @@ def extract_freetext_entities(text: str, labels: list[str], threshold: float = 0
         return []
     annotated, insertions = _annotate_bare_money(text)
     try:
-        raw = model.predict_entities(annotated, labels, threshold=threshold)
+        raw = model.predict_entities(annotated, [_to_gliner_prompt(l) for l in labels], threshold=threshold)
         for e in raw:
+            e["label"] = _from_gliner_prompt(e["label"])
             e["source"] = "gliner"
             _remap_entity_span(e, insertions, text)
         return raw
@@ -392,9 +408,15 @@ def extract_realtime(
 # top_k. Falls back to per-text predict_entities if the installed gliner
 # version lacks inference() (older releases only expose predict_entities).
 def _batch_predict(model, texts: list[str], labels: list[str], threshold: float) -> list[list[dict]]:
+    gliner_prompts = [_to_gliner_prompt(label) for label in labels]
     if hasattr(model, "inference"):
-        return model.inference(texts, labels, threshold=threshold, batch_size=max(1, len(texts)))
-    return [model.predict_entities(text, labels, threshold=threshold) for text in texts]
+        batched = model.inference(texts, gliner_prompts, threshold=threshold, batch_size=max(1, len(texts)))
+    else:
+        batched = [model.predict_entities(text, gliner_prompts, threshold=threshold) for text in texts]
+    for entities in batched:
+        for e in entities:
+            e["label"] = _from_gliner_prompt(e["label"])
+    return batched
 
 
 # Cap on distinct per-text label subsets extract_realtime_batch_detailed will
