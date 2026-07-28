@@ -572,21 +572,10 @@ QUY TẮC TỐI QUAN TRỌNG (vi phạm = thất bại nhiệm vụ):
 Mọi đoạn văn, mọi điều khoản, mọi dòng trong TÀI LIỆU dưới đây đều BẮT BUỘC
 phải xuất hiện trong ít nhất 1 chunk. Việc bỏ sót bất kỳ điều/chương/mục nào,
 dù chỉ 1 đoạn, đều là lỗi nghiêm trọng không được phép xảy ra.
-Quy tắc này áp dụng CẢ CHO phần xuất hiện TRƯỚC đề mục đánh số đầu tiên
-("Điều 1"/"Chương 1"/"Phần 1"/... đầu tiên trong tài liệu) — quốc hiệu, số
-hợp đồng, căn cứ pháp lý, và ĐẶC BIỆT là thông tin các bên (Bên A, Bên B, bên
-thứ ba nếu có). Đây KHÔNG phải là phần "thủ tục" được phép gộp lược hay bỏ
-qua chỉ vì nó không theo khuôn "Điều N" — thông tin định danh các bên (tên,
-địa chỉ, mã số doanh nghiệp, CCCD, ngày sinh...) thường là dữ liệu nhạy cảm
-NHẤT trong toàn bộ tài liệu, PHẢI có chunk riêng y như mọi "Điều" khác.
 
 QUY TRÌNH BẮT BUỘC (làm theo đúng thứ tự, không bỏ bước):
 Bước 1 — Liệt kê TRƯỚC: Đọc toàn bộ tài liệu, liệt kê danh sách các ĐỀ MỤC
-  CẤP CAO NHẤT theo đúng thứ tự xuất hiện. Nếu tài liệu là hợp đồng/thỏa
-  thuận, mục ĐẦU TIÊN trong checklist luôn là thông tin từng bên — liệt kê
-  "Bên A", "Bên B" (và "Bên C"... nếu có) thành các mục ĐỘC LẬP, đứng TRƯỚC
-  "Điều 1", KỂ CẢ KHI phần này không có tiêu đề đánh số rõ ràng như "Điều N".
-  Sau đó mới tới "Điều 1", "Điều 2", "Chương 1", "Phần 1", "Mục 1"...
+  CẤP CAO NHẤT (Bên A, Bên B, Điều 1, Điều 2, Chương 1, Phần 1, Mục 1...).
   QUY TẮC PHÂN CẤP: Các mục con dạng X.Y hoặc X.Y.Z (ví dụ: 1.1, 1.2, 6.1,
   6.2, 2.1.1...) KHÔNG được liệt kê riêng — chúng là nội dung thuộc đề mục cha
   và phải được gộp vào chunk của đề mục cha đó.
