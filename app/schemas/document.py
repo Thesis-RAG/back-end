@@ -153,6 +153,16 @@ class DocumentChunkUpdate(BaseModel):
     chunk_sensitivity: int = Field(default=2, ge=1, le=5)
 
 
+class DocumentChunkCreate(BaseModel):
+    # Position to insert at, 0-based — out-of-range values are clamped to the
+    # nearest valid slot (append at the end) by document_service.create_chunk,
+    # not rejected.
+    chunk_index: int = Field(..., ge=0)
+    section_heading: str = Field(default="", max_length=500)
+    chunk_text: str = Field(..., min_length=1)
+    chunk_sensitivity: int = Field(default=2, ge=1, le=5)
+
+
 class PolicySnapshotRead(BaseModel):
     model_config = ConfigDict(from_attributes=True)
 

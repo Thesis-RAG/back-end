@@ -575,7 +575,7 @@ dù chỉ 1 đoạn, đều là lỗi nghiêm trọng không được phép xả
 
 QUY TRÌNH BẮT BUỘC (làm theo đúng thứ tự, không bỏ bước):
 Bước 1 — Liệt kê TRƯỚC: Đọc toàn bộ tài liệu, liệt kê danh sách các ĐỀ MỤC
-  CẤP CAO NHẤT (ví dụ: Bên A, Bên B, Điều 1, Điều 2, Chương 1, Phần 1, Mục 1...).
+  CẤP CAO NHẤT (ví dụ: Nếu là hợp đồng thì phải tách riêng Bên A và Bên B, Điều 1, Điều 2, Chương 1, Phần 1, Mục 1...).
   QUY TẮC PHÂN CẤP: Các mục con dạng X.Y hoặc X.Y.Z (ví dụ: 1.1, 1.2, 6.1,
   6.2, 2.1.1...) KHÔNG được liệt kê riêng — chúng là nội dung thuộc đề mục cha
   và phải được gộp vào chunk của đề mục cha đó.

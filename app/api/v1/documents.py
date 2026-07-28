@@ -18,6 +18,7 @@ from app.repositories.document_access_request_repository import doc_access_reque
 from app.repositories.storage_repository import StorageRepository
 from app.schemas.document import (
     ChunkingConfig,
+    DocumentChunkCreate,
     DocumentChunkRead,
     DocumentChunkUpdate,
     DocumentCreateRequest,
@@ -268,6 +269,29 @@ def list_document_chunks(
     current_user: User = Depends(get_current_user),
 ):
     chunks = document_service.list_chunks(db, current_user, document_id, version_id)
+    return [DocumentChunkRead.model_validate(c) for c in chunks]
+
+
+# Insert a new chunk at an admin-chosen position — embeds into Chroma,
+# shifts/renumbers the remaining chunks, and re-signs the version's content
+# signature, then returns the full updated chunk list (see
+# document_service.create_chunk).
+@router.post(
+    "/{document_id}/versions/{version_id}/chunks",
+    response_model=list[DocumentChunkRead],
+)
+def create_document_chunk(
+    document_id: str,
+    version_id: str,
+    payload: DocumentChunkCreate,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    chunks = document_service.create_chunk(
+        db, current_user, document_id, version_id,
+        chunk_index=payload.chunk_index, section_heading=payload.section_heading,
+        chunk_text=payload.chunk_text, chunk_sensitivity=payload.chunk_sensitivity,
+    )
     return [DocumentChunkRead.model_validate(c) for c in chunks]
 
 

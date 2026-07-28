@@ -482,6 +482,114 @@ class DocumentService:
             .all()
         )
 
+    # Insert a brand-new chunk at an admin-chosen position from the chunk-
+    # metadata editor. Mirrors delete_chunk's renumbering (same "shift +
+    # recompute position_ratio for the whole sequence" shape, just shifting
+    # up instead of down) and update_chunk's embed/upsert/re-sign steps, so
+    # the new chunk is immediately live in retrieval like any ingested one.
+    def create_chunk(
+        self, db: Session, user: User, doc_id: str, version_id: str,
+        *, chunk_index: int, section_heading: str, chunk_text: str, chunk_sensitivity: int = 2,
+    ) -> list[DocumentChunk]:
+        doc = self.docs.get_by_id(db, doc_id)
+        if not doc:
+            raise HTTPException(status_code=404, detail="Document not found")
+        ok, reason = self._can_edit(db, user, doc)
+        if not ok:
+            raise HTTPException(status_code=403, detail=reason)
+        version = self.versions.get_by_id(db, version_id)
+        if not version or version.document_id != doc.id:
+            raise HTTPException(status_code=404, detail="Version not found")
+
+        chunk_text = chunk_text.strip()
+        section_heading = section_heading.strip()
+        chunk_sensitivity = max(1, min(5, int(chunk_sensitivity or 2)))
+        if not chunk_text:
+            raise HTTPException(status_code=422, detail="Nội dung chunk không được để trống")
+
+        existing = (
+            db.query(DocumentChunk)
+            .filter(DocumentChunk.document_version_id == version_id)
+            .order_by(DocumentChunk.chunk_index.asc())
+            .all()
+        )
+        # Clamp to a valid slot: 0..len(existing) — a stale index from a UI
+        # that hasn't refreshed appends at the end instead of erroring.
+        insert_at = max(0, min(int(chunk_index), len(existing)))
+
+        embed_text = f"{section_heading}\n\n{chunk_text}" if section_heading else chunk_text
+        new_chunk = DocumentChunk(
+            document_version_id=version_id,
+            chunk_index=insert_at,
+            chunk_text=chunk_text,
+            page_start=None,
+            page_end=None,
+            token_count=max(1, (len(chunk_text) + 3) // 4),
+            chunk_hash=hashlib.sha256(chunk_text.encode("utf-8")).hexdigest(),
+            metadata_json={
+                "section_index":     insert_at,
+                "section_heading":   section_heading,
+                "position_ratio":    0.0,  # corrected below alongside every other chunk
+                "local_chunk_index": 0,
+                "chunker_mode":      "manual",
+                "chunk_sensitivity": chunk_sensitivity,
+            },
+        )
+        # Shift every existing chunk at/after the insertion point up by one
+        # so the new chunk's index never collides with one already in use.
+        for c in existing:
+            if c.chunk_index >= insert_at:
+                c.chunk_index += 1
+        db.add(new_chunk)
+        db.flush()
+
+        vector = embedding_service.embed(embed_text)
+        chroma_service.upsert_chunk(
+            chunk_id=new_chunk.id,
+            document_text=embed_text,
+            embedding=vector,
+            metadata={
+                "document_id":            doc.id,
+                "document_version_id":    version.id,
+                "document_title":         doc.title,
+                "document_type":          doc.document_type,
+                "sensitivity":            doc.sensitivity,
+                "data_type":              doc.data_type,
+                "chunk_index":            insert_at,
+                "page_start":             None,
+                "page_end":               None,
+                "section_index":          insert_at,
+                "position_ratio":         0.0,
+                "chunker_mode":           "manual",
+                "chunk_sensitivity":      chunk_sensitivity,
+                "policy_profile":         version.policy_profile,
+                "policy_version":         version.policy_version,
+            },
+        )
+
+        # Renumber position_ratio across the whole (now one-longer) sequence
+        # — same shape as delete_chunk's renumbering pass — pushing to
+        # Chroma only for chunks whose index/ratio actually changed.
+        all_chunks = sorted(existing + [new_chunk], key=lambda c: c.chunk_index)
+        total = len(all_chunks)
+        for c in all_chunks:
+            new_ratio = round(c.chunk_index / max(1, total), 4)
+            meta = dict(c.metadata_json or {})
+            if c.id != new_chunk.id and meta.get("position_ratio") == new_ratio:
+                continue
+            meta["position_ratio"] = new_ratio
+            c.metadata_json = meta
+            chroma_service.update_document_metadata(
+                [c.id], {"chunk_index": c.chunk_index, "position_ratio": new_ratio},
+            )
+        db.flush()
+
+        self._resign_version(db, version)
+        db.commit()
+        for c in all_chunks:
+            db.refresh(c)
+        return all_chunks
+
     # Edit a chunk's heading + text from the admin UI. Keeps MySQL, Chroma
     # (re-embedded — a stale vector for edited text would silently break
     # semantic search) and the version's content signature all in sync, so
