@@ -9,7 +9,6 @@ from collections import defaultdict
 from pathlib import Path
 
 from fastapi import HTTPException
-from sqlalchemy import or_
 from sqlalchemy.orm import Session
 
 from app.core.config import settings
@@ -133,27 +132,32 @@ class DocumentService:
 
     # ── CRUD ──────────────────────────────────────────────────────────────────
 
-    # Return all documents the user may view via FGA grants and ownership.
+    # Return the set of document IDs visible to the user: public documents
+    # (sensitivity == MIN_SENSITIVITY, regardless of OUI branch), documents
+    # FGA grants can_view on (own OUI branch, clearance-gated — see
+    # app/fga/model.json), and documents the user owns outright. This is the
+    # single source of truth for "what can this user see" — both the
+    # Documents tab (list_documents below) and the RAG retrieval corpus
+    # (retrieval_service._retrieve_main) read from it, so a document never
+    # appears in chat answers that the user couldn't otherwise browse to.
+    def visible_document_ids(self, db: Session, user: User) -> set[str]:
+        viewable_ids = set(fga_adapter.list_viewable_document_ids(user.id, self._user_clearance(db, user)))
+        public_ids = {
+            str(row[0]) for row in
+            db.query(Document.id).filter(Document.sensitivity == MIN_SENSITIVITY).all()
+        }
+        owned_ids = {
+            str(row[0]) for row in
+            db.query(Document.id).filter(Document.owner_user_id == user.id).all()
+        }
+        return viewable_ids | public_ids | owned_ids
+
+    # Return all documents the user may view via FGA grants, public status, and ownership.
     def list_documents(self, db: Session, user: User) -> list[Document]:
-        viewable_ids = fga_adapter.list_viewable_document_ids(user.id, self._user_clearance(db, user))
-        public_filter = Document.sensitivity == MIN_SENSITIVITY
-        if not viewable_ids:
-            # Public documents are visible to every authenticated user, even
-            # when they have no OUI grant. Owners can always view their own
-            # documents as well.
-            return db.query(Document).filter(
-                or_(
-                    public_filter,
-                    Document.owner_user_id == user.id,
-                )
-            ).all()
-        return db.query(Document).filter(
-            or_(
-                public_filter,
-                Document.id.in_(viewable_ids),
-                Document.owner_user_id == user.id,
-            )
-        ).all()
+        ids = self.visible_document_ids(db, user)
+        if not ids:
+            return []
+        return db.query(Document).filter(Document.id.in_(ids)).all()
 
     # Fetch a document by ID, raising 403/404 if missing or inaccessible.
     def get_document(self, db: Session, user: User, doc_id: str) -> Document:

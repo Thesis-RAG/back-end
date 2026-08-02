@@ -205,6 +205,19 @@ class LLMService:
             chunk_id = ctx.get("chunk_id")
             metadata = ctx.get("metadata") or {}
             page = metadata.get("source_page") or metadata.get("page_start") or metadata.get("page")
+            # Heading is derived from document content (chunker-extracted or
+            # LLM-synthesized, see chunker_service), never developer-authored
+            # like chunk_id/score/page — so it goes through the same
+            # sanitization as doc_text and is prepended INSIDE the untrusted
+            # wrap below, not into the plain header line. Falls back to the
+            # document title so every context still carries some heading
+            # even for chunks with no section_heading captured (eg a bare
+            # table-continuation chunk), which is what actually motivated
+            # this: without it, the model loses track of what a heading-less
+            # table row belongs to once several contexts are concatenated.
+            heading = _strip_system_tags(
+                str(metadata.get("section_heading") or metadata.get("document_title") or "").strip()
+            )
 
             header_parts = [f"[Context {idx}]"]
             if chunk_id:
@@ -215,7 +228,16 @@ class LLMService:
                 header_parts.append(f"page={page}")
 
             header = " | ".join(header_parts)
-            context_blocks.append(f"{header}\n{prompt_injection_guard.wrap_untrusted_context(doc_text)}")
+            # heading passed as its own arg (not joined into the body string)
+            # so it lands on its own line directly above [Content] inside
+            # the wrap — wrap_untrusted_context's normalize() flattens ALL
+            # whitespace in the body to single spaces, so a "\n" joined into
+            # the body itself could never survive as a visible line break.
+            content_wrapped = prompt_injection_guard.wrap_untrusted_context(
+                f"[Content]: {doc_text}",
+                heading=f"[Heading]: {heading}" if heading else None,
+            )
+            context_blocks.append(f"{header}\n{content_wrapped}")
 
         # Aggregate cap across ALL retrieved docs combined, not just per-doc
         # (wrap_untrusted_context above only bounds one doc at a time — with

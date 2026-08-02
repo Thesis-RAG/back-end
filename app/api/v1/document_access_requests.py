@@ -245,9 +245,15 @@ def get_document_access_status(
     """
     user_clearance = _get_user_clearance(current_user)
 
+    # Owners are never locked out of their own document, regardless of their
+    # personal clearance vs. a chunk's sensitivity — matches the exemption
+    # applied in view_document_file below.
+    doc = db.get(Document, document_id)
+    is_owner = bool(doc and doc.owner_user_id == current_user.id)
+
     # Read max chunk_sensitivity from Chroma (consistent with retrieval_service blur logic).
     max_chunk_sens = chroma_service.get_max_chunk_sensitivity(document_id)
-    has_restricted = max_chunk_sens > user_clearance
+    has_restricted = (not is_owner) and max_chunk_sens > user_clearance
 
     latest = doc_access_request_repo.get_latest_for_user_doc(db, str(current_user.id), document_id)
     status: str | None = None

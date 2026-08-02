@@ -46,7 +46,7 @@ class Settings(BaseSettings):
 
     max_upload_size_mb: int = 50
     default_policy_version: str = "v1"
-    gliner_model_name: str = "urchade/gliner_multi-v2.1"
+    gliner_model_name: str = "fastino/gliner2-privacy-filter-PII-multi"
     gliner_threshold: float = 0.3
 
     # Cross-encoder reranking applied after RRF candidate fusion.

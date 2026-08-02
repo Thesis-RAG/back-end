@@ -56,13 +56,18 @@ def update_settings(
         "rag.similarity_threshold",
         "rag.hybrid_search",
         "rag.rerank_enabled",
-        "query_scope_mode",
         "llm.provider",
         "llm.chat_model",
         "llm.reasoning_effort",
         "llm.embedding_model",
+        "entity_extraction.use_llm",
+        "entity_extraction.label_prefilter_enabled",
     }
     filtered = {k: v for k, v in payload.items() if k in allowed_keys}
+    if "entity_extraction.use_llm" in filtered and not isinstance(filtered["entity_extraction.use_llm"], bool):
+        raise HTTPException(status_code=422, detail="entity_extraction.use_llm must be a boolean")
+    if "entity_extraction.label_prefilter_enabled" in filtered and not isinstance(filtered["entity_extraction.label_prefilter_enabled"], bool):
+        raise HTTPException(status_code=422, detail="entity_extraction.label_prefilter_enabled must be a boolean")
     if "llm.provider" in filtered and filtered["llm.provider"] not in {None, "openai", "ollama"}:
         raise HTTPException(status_code=422, detail="llm.provider must be openai or ollama")
     if "llm.chat_model" in filtered and filtered["llm.chat_model"] not in {None, *(item["id"] for item in CHAT_MODEL_OPTIONS)}:
