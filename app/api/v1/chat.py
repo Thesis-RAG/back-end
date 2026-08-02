@@ -29,6 +29,7 @@ from app.services.chat_service import chat_service
 from app.services.llm_service import llm_service
 from app.services.retrieval_service import retrieval_service
 from app.services.entity_policy_service import entity_policy_service
+from app.repositories.system_setting_repository import system_setting_repository
 
 logger = logging.getLogger(__name__)
 
@@ -186,12 +187,22 @@ def search_documents(
 ):
     query = payload.get("query", "").strip()
     mode = payload.get("mode", "hybrid")
-    top_k = min(int(payload.get("top_k", 10)), 20)
+    oui_ids = payload.get("oui_ids") or None
+    # Same source of truth as chat (chat_service.py reads this identically) —
+    # top_k/similarity_threshold are admin-configured settings, not per-request values.
+    top_k = int(system_setting_repository.get(db, "rag.top_k") or 5)
+    min_score = float(system_setting_repository.get(db, "rag.similarity_threshold") or 0.0)
     if not query:
         return []
-    results = retrieval_service.retrieve(
-        query=query, user=current_user, top_k=top_k, mode=mode, db=db
+    retrieved_raw = retrieval_service.retrieve(
+        query=query, user=current_user, top_k=top_k, mode=mode, oui_ids=oui_ids, db=db
     )
+    # Same normalization chat runs before build_prompt — search shows exactly
+    # the chunks a chat answer would be grounded on (minus the LLM call), not
+    # a separate/looser view of the corpus. This also means chunks that
+    # retrieval_service already dropped for exceeding the user's clearance
+    # never reach here — no blurred/restricted chunk to special-case in the UI.
+    results = chat_service._normalize_retrieved(retrieved_raw, limit=top_k, min_score=min_score)
     results, _contracts = entity_policy_service.apply_to_retrieved(
         db, current_user, query, results
     )

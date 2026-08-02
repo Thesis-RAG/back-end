@@ -27,7 +27,6 @@ from app.repositories.trace_repository import TraceRepository
 from app.services.answer_service import answer_service
 from app.services.audit_service import audit_service
 from app.services.guard_service import guard_service
-from app.services.guard_service import sanitize_masked_markers
 from app.services.llm_service import llm_service
 from app.services.memory_service import memory_service
 from app.services.entity_policy_service import entity_policy_service
@@ -104,13 +103,32 @@ def _log_llm_response(tid: str, text: str | None) -> None:
     print(f"[LLM-RESPONSE] trace_id={tid} chars={len(text)}\n{text}\n[/LLM-RESPONSE]")
 
 
+# Live-stream a RAG answer safely, one complete line at a time.
+#
+# Two things are deliberately never shown while the model is still
+# generating (they can only be computed correctly once the full answer is
+# known — see _normalize_citations/_drop_hidden_output_lines):
+#   - citation markers ("[N]") — final numbering depends on the complete set
+#     of citations, which isn't known mid-generation. Stripped from the live
+#     preview entirely; the "done" event's fully-processed content (which
+#     the frontend swaps in wholesale, not appended) carries the real,
+#     correctly-numbered citations.
+#   - lines matching _HIDDEN_OUTPUT_RE — the same check the final,
+#     whole-answer pass (_drop_hidden_output_lines) applies, just evaluated
+#     per line as each one completes instead of once at the end. This is
+#     the actual current masking convention (bullet-run/"đã bị ẩn"-style
+#     language), not the legacy "[ENTITY_TYPE]" bracket markers
+#     sanitize_masked_markers was built for — reusing that older helper
+#     here would silently fail to catch anything real.
+#
+# Keeping an incomplete line buffered until its trailing "\n" arrives
+# prevents a citation marker or hidden-output phrase split across model
+# token boundaries from ever reaching the client half-formed. This does
+# NOT catch a hidden-output phrase itself split across two lines (eg
+# "Thông tin ...\n... đã được ẩn.") — the whole-answer pass has the same
+# blind spot today (it also checks line by line), so streaming inherits an
+# existing limitation rather than introducing a new one.
 def _safe_stream_fragment(buffer: str, fragment: str, *, final: bool = False) -> tuple[str, list[str]]:
-    """Emit completed lines after removing internal redaction markers.
-
-    Keeping an incomplete line buffered prevents a marker split across model
-    tokens from reaching the client. Table rows containing a masked value are
-    omitted entirely.
-    """
     buffer += fragment
     parts = buffer.split("\n")
     remainder = parts.pop() if not final else ""
@@ -119,9 +137,9 @@ def _safe_stream_fragment(buffer: str, fragment: str, *, final: bool = False) ->
 
     emitted: list[str] = []
     for line in parts:
-        cleaned = sanitize_masked_markers(line, drop_masked_lines=True)
-        if cleaned:
-            emitted.append(cleaned + "\n")
+        if _HIDDEN_OUTPUT_RE.search(line):
+            continue
+        emitted.append(re.sub(r"\[\d+\]", "", line) + "\n")
 
     if final:
         remainder = ""
@@ -299,6 +317,7 @@ class ChatService:
                 "semantic_score": r.get("semantic_score"),
                 "keyword_score":  r.get("keyword_score"),
                 "distance":       r.get("distance"),
+                "sources":        r.get("sources", []),
             })
         cleaned.sort(
             key=lambda x: (x["score"] is not None, x["score"] if x["score"] is not None else -1.0),
@@ -681,6 +700,13 @@ Câu hỏi: {query}"""
         retrieval_queries = [_trim_query_for_retrieval(q) for q in queries]
         print(f"[QUERY-TRIM] {list(zip(queries, retrieval_queries))}", flush=True)
 
+        # Timing checkpoints for the Audit page latency breakdown (bucket
+        # "6.1" = retrieval + rerank, "6.2" = everything after it in this
+        # pipeline — entity detection/masking plus the lightweight rule/
+        # history bookkeeping below). See post_message_stream for how these
+        # combine with the guard/query-analysis and build-prompt/first-token
+        # buckets into the full breakdown.
+        _t_retrieval_start = time.perf_counter()
         try:
             if len(retrieval_queries) > 1:
                 retrieved_raw = retrieval_service.retrieve_multi(
@@ -703,6 +729,8 @@ Câu hỏi: {query}"""
         except Exception:
             logger.exception("Retrieval failed trace_id=%s chat_mode=%s", tid, chat_mode)
             retrieved_raw = []
+        _retrieval_rerank_ms = int((time.perf_counter() - _t_retrieval_start) * 1000)
+        _t_entity_start = time.perf_counter()
 
         # Each sub-query already caps to _top_k independently (that's the
         # point of splitting) — cap the merged set at _top_k per sub-query,
@@ -773,6 +801,7 @@ Câu hỏi: {query}"""
 
         history = self._load_history(db, conversation_id, effective_query)
         safe_history: list = [] if has_restricted else history
+        _entity_policy_ms = int((time.perf_counter() - _t_entity_start) * 1000)
 
         return {
             "retrieved":        retrieved,
@@ -783,6 +812,10 @@ Câu hỏi: {query}"""
             "has_watermark":    has_watermark,
             "has_restricted":   has_restricted,
             "safe_history":     safe_history,
+            "timings": {
+                "retrieval_rerank_ms": _retrieval_rerank_ms,
+                "entity_policy_ms":    _entity_policy_ms,
+            },
         }
 
     @staticmethod
@@ -1375,6 +1408,9 @@ Câu hỏi: {query}"""
         query_analysis = self._analyze_query(db, conversation_id, effective_query)
         effective_query = query_analysis["rewritten_query"]
         stream_sub_queries = query_analysis["sub_queries"]
+        # Audit-page latency breakdown bucket "1-5": everything above,
+        # from message intake through Guard 1 and query analysis.
+        _guard_analyze_ms = int((time.perf_counter() - _start) * 1000)
 
         # Create a streaming placeholder assistant message to return the ID immediately.
         assistant_msg = Message(
@@ -1401,6 +1437,21 @@ Câu hỏi: {query}"""
         stream_has_watermark = False
         stream_cited_indices: set[int] | None = None
         stream_is_no_answer = False
+        # Audit-page latency breakdown, buckets "6.1"/"6.2" (filled in from
+        # _run_rag_pipeline's own timings once the RAG branch below runs)
+        # and "7-8" (build_prompt start -> first streamed token). None stays
+        # None for chatbot mode or whenever generation never streams a token
+        # (no retrieved chunks, LLM not configured, stream raised before any
+        # token) — the persist step below falls back to full elapsed time.
+        _retrieval_rerank_ms: int | None = None
+        _entity_policy_ms: int | None = None
+        _first_token_ms: int | None = None
+        _ttft_ms: int | None = None
+        # Set once the RAG branch below has already streamed a citation-
+        # stripped, hidden-output-filtered live preview line by line — the
+        # chatbot branch has no citations/policy content to hide, so it
+        # still uses the simpler replay-after-the-fact below unchanged.
+        _already_streamed_live = False
 
         # ── CHATBOT MODE ──────────────────────────────────────────────
         if mode == "chatbot":
@@ -1453,6 +1504,9 @@ Câu hỏi: {query}"""
             stream_policy_summary   = ctx.get("policy_summary", [])
             stream_has_watermark    = ctx["has_watermark"]
             safe_history            = ctx["safe_history"]
+            _rag_timings            = ctx.get("timings") or {}
+            _retrieval_rerank_ms    = _rag_timings.get("retrieval_rerank_ms")
+            _entity_policy_ms       = _rag_timings.get("entity_policy_ms")
 
             if stream_applied_rules:
                 yield {"type": "policy_rules", "rules": stream_applied_rules}
@@ -1475,6 +1529,8 @@ Câu hỏi: {query}"""
                         "Không xác định danh tính cụ thể. "
                         "Không nói 'không có trong tài liệu' nếu thông tin liên quan (dù đã ẩn danh) thực sự có trong context."
                     ) if _stream_has_transform else None
+                    # Audit-page latency breakdown bucket "7-8" starts here.
+                    _build_prompt_start = time.perf_counter()
                     prompt = llm_service.build_prompt(
                         question=llm_extra_context + effective_query,
                         contexts=retrieved,
@@ -1483,8 +1539,31 @@ Câu hỏi: {query}"""
                     )
                     _log_final_prompt(tid, prompt)
 
+                    # Live preview only — citation-stripped, hidden-output
+                    # lines dropped (see _safe_stream_fragment). full_text
+                    # still accumulates the raw model output for the
+                    # citation/filter/table passes below; the "done" event
+                    # sent after those replaces this preview with the
+                    # authoritative final answer (frontend swaps content
+                    # wholesale on "done", not append), so nothing here
+                    # needs to be exactly right — only safe to show.
+                    _stream_buffer = ""
                     for token in llm_service.generate_stream(prompt=prompt, max_tokens=2048):
+                        if _first_token_ms is None:
+                            # "Độ trễ" shown on the Audit page stops here —
+                            # once the model starts streaming, the user is
+                            # no longer waiting idle, so the rest of
+                            # generation isn't counted as latency.
+                            _first_token_ms = int((time.perf_counter() - _build_prompt_start) * 1000)
+                            _ttft_ms = int((time.perf_counter() - _start) * 1000)
                         full_text += token
+                        _stream_buffer, preview_lines = _safe_stream_fragment(_stream_buffer, token)
+                        for preview_line in preview_lines:
+                            yield {"type": "token", "text": preview_line}
+                    _, preview_lines = _safe_stream_fragment(_stream_buffer, "", final=True)
+                    for preview_line in preview_lines:
+                        yield {"type": "token", "text": preview_line}
+                    _already_streamed_live = True
 
                     full_text = re.sub(r"<think>.*?</think>", "", full_text, flags=re.DOTALL).strip()
                     logger.info("LLM stream result len=%d", len(full_text))
@@ -1527,14 +1606,28 @@ Câu hỏi: {query}"""
         if stream_has_watermark and full_text:
             full_text += "\n\n---\n⚠️ Nội dung này được truy cập theo điều kiện kiểm soát phân quyền. Hoạt động truy vấn đã được ghi nhận."
 
-        # Do not expose the raw LLM stream before the final safety filter.
-        # Emit the already-filtered answer in small chunks to retain the
-        # streaming UI without allowing hidden values to reach the browser.
-        for offset in range(0, len(full_text), 160):
-            yield {"type": "token", "text": full_text[offset:offset + 160]}
+        # RAG mode already streamed a safe live preview above, line by line,
+        # as the model generated it — the "done" event below carries this
+        # fully-processed text and the frontend replaces the preview with
+        # it wholesale, so replaying it here again would just show it
+        # twice. Chatbot mode has no citations/policy content to withhold,
+        # so it never streamed a preview and still needs this replay to
+        # produce any "token" events at all.
+        if not _already_streamed_live:
+            for offset in range(0, len(full_text), 160):
+                yield {"type": "token", "text": full_text[offset:offset + 160]}
 
         # ── Persist ───────────────────────────────────────────────────
-        _latency_ms = int((time.perf_counter() - _start) * 1000)
+        # _full_latency_ms is the true end-to-end duration (includes full
+        # generation, citation/filter passes, DB writes) — kept as-is for
+        # the audit-log compliance record. _ttft_ms (time to first streamed
+        # token) is what the Audit page shows as "Độ trễ" — see the field
+        # comments above for why. Falls back to the full duration whenever
+        # nothing ever streamed (chatbot mode, no retrieved chunks, LLM not
+        # configured, or the stream raised before yielding a token).
+        _full_latency_ms = int((time.perf_counter() - _start) * 1000)
+        if _ttft_ms is None:
+            _ttft_ms = _full_latency_ms
         assistant_msg.content = full_text
         assistant_msg.status  = "success"
         assistant_msg.applied_rules_json = final_stream_applied_rules
@@ -1543,7 +1636,14 @@ Câu hỏi: {query}"""
         tr.assistant_output_summary = full_text[:2000] if full_text else None
         tr.retrieved_sources = [] if mode == "chatbot" else retrieved_raw
         tr.llm_response      = {"text": full_text}
-        tr.timings           = {"total_ms": _latency_ms}
+        tr.timings = {"total_ms": _ttft_ms}
+        if mode != "chatbot":
+            tr.timings["breakdown"] = [
+                {"key": "1-5", "label": "Guard & phân tích câu hỏi", "ms": _guard_analyze_ms},
+                {"key": "6.1", "label": "Retrieval & rerank", "ms": _retrieval_rerank_ms},
+                {"key": "6.2", "label": "Nhận diện & áp policy thực thể", "ms": _entity_policy_ms},
+                {"key": "7-8", "label": "Build prompt → token đầu tiên", "ms": _first_token_ms},
+            ]
         tr.status            = "completed"
         audit_service.log_action(
             db, trace_id=tid, user_id=user.id,
@@ -1551,7 +1651,7 @@ Câu hỏi: {query}"""
             resource_id=conversation_id, decision="allow",
             input_json={"message": content, "effective_query": effective_query},
             output_json={"assistant_message": full_text[:500], "sources": sources},
-            latency_ms=_latency_ms,
+            latency_ms=_full_latency_ms,
         )
         db.commit()
 

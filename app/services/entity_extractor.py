@@ -1,8 +1,13 @@
 """
 Hybrid entity extraction pipeline with three layers:
-  Layer 1 (Regex)  — structured PII (email, phone, national_id, ...)
-  Layer 2 (GLiNER) — free-text entities from the shared baseline and file actions
-  Layer 3 (Rule)   — boolean summary labels and chunk sensitivity scoring
+  Layer 1 (Regex)       — structured PII (email, phone, national_id, ...)
+  Layer 2 (GLiNER2/LLM) — free-text entities from the shared baseline and file actions.
+                           Uses GLiNER2 (local model) by default; if the
+                           "entity_extraction.use_llm" system setting is on,
+                           routes chunk text to the configured LLM instead
+                           (slower/costs tokens, but can generalize to entity
+                           types GLiNER2 was never fine-tuned on).
+  Layer 3 (Rule)         — boolean summary labels and chunk sensitivity scoring
 
 Boolean flags (fixed vocabulary used for sensitivity metadata):
   has_pii        — personal identifiable information
@@ -19,6 +24,7 @@ Entity type → flag mapping:
 """
 from __future__ import annotations
 
+import json
 import logging
 import re
 import threading
@@ -27,6 +33,38 @@ import time
 logger = logging.getLogger(__name__)
 
 # ── Regex patterns (Layer 1) ──────────────────────────────────────────────────
+
+# GLiNER2 empirically cannot detect Vietnamese street addresses at all — under
+# any label wording (address/employee_address/location), confidence stays
+# ~0 for the full "số nhà + đường + phường + quận + tỉnh/thành phố" span; it
+# only ever catches isolated city/district name fragments under "location".
+# This regex exists specifically to cover that gap as a Layer-1 fallback.
+#
+# Enumerable list of VN provinces/centrally-run cities — the one part of a
+# Vietnamese address that's a closed, reliable vocabulary (street/ward/
+# district names are open-ended and can't be enumerated this way).
+_VN_PROVINCES = (
+    r"(?:Hà\s*Nội|TP\.?\s*Hồ\s*Chí\s*Minh|Thành\s*phố\s*Hồ\s*Chí\s*Minh|Hồ\s*Chí\s*Minh|TP\.?\s*HCM|TPHCM|"
+    r"Hải\s*Phòng|Đà\s*Nẵng|Cần\s*Thơ|An\s*Giang|Bà\s*Rịa[\s\-]*Vũng\s*Tàu|Bạc\s*Liêu|Bắc\s*Giang|"
+    r"Bắc\s*Kạn|Bắc\s*Ninh|Bến\s*Tre|Bình\s*Định|Bình\s*Dương|Bình\s*Phước|Bình\s*Thuận|"
+    r"Cà\s*Mau|Cao\s*Bằng|Đắk\s*Lắk|Đắk\s*Nông|Điện\s*Biên|Đồng\s*Nai|Đồng\s*Tháp|Gia\s*Lai|"
+    r"Hà\s*Giang|Hà\s*Nam|Hà\s*Tĩnh|Hải\s*Dương|Hậu\s*Giang|Hòa\s*Bình|Hưng\s*Yên|"
+    r"Khánh\s*Hòa|Kiên\s*Giang|Kon\s*Tum|Lai\s*Châu|Lâm\s*Đồng|Lạng\s*Sơn|Lào\s*Cai|"
+    r"Long\s*An|Nam\s*Định|Nghệ\s*An|Ninh\s*Bình|Ninh\s*Thuận|Phú\s*Thọ|Phú\s*Yên|"
+    r"Quảng\s*Bình|Quảng\s*Nam|Quảng\s*Ngãi|Quảng\s*Ninh|Quảng\s*Trị|Sóc\s*Trăng|"
+    r"Sơn\s*La|Tây\s*Ninh|Thái\s*Bình|Thái\s*Nguyên|Thanh\s*Hóa|Thừa\s*Thiên[\s\-]*Huế|"
+    r"Tiền\s*Giang|Trà\s*Vinh|Tuyên\s*Quang|Vĩnh\s*Long|Vĩnh\s*Phúc|Yên\s*Bái)"
+)
+
+# Street/ward/district-level keywords. Deliberately used only to VALIDATE a
+# candidate span (via the lookahead below), not to anchor every segment —
+# real addresses routinely drop the "Quận"/"Thành phố" prefix in casual
+# writing (eg "Cầu Giấy, Hà Nội" with no "Quận" before "Cầu Giấy"), so
+# requiring a keyword on every segment would silently under-match.
+_VN_ADDRESS_KEYWORDS = (
+    r"(?:Số\s*nhà|Số\s*\d|đường|phố|ngõ|hẻm|ngách|kiệt|thôn|xóm|ấp|tổ\s*\d|"
+    r"khu\s*phố|căn\s*hộ|chung\s*cư|tòa\s*nhà|Phường|Xã|Thị\s*trấn|Quận|Huyện|Thị\s*xã)"
+)
 
 REGEX_PATTERNS: dict[str, re.Pattern] = {
     "email": re.compile(r"[\w.+-]+@[\w-]+\.[\w.-]+"),
@@ -47,6 +85,28 @@ REGEX_PATTERNS: dict[str, re.Pattern] = {
         r"(?i)\b(?:password|mật khẩu|api[_\s-]?key|token|secret|otp)\b\s*[:=]\s*[^\s,;]+"
     ),
 }
+
+# Not registered under a single fixed key in REGEX_PATTERNS — applied
+# dynamically (see extract_structured_entities below) to EVERY active
+# entity_key whose name contains "address" (employee_address,
+# contract_address, ...), so new address-type labels added later in
+# Settings pick this up for free with no code change.
+#
+# Bounded window ending at a known province/city name (start-of-line or
+# after a strong delimiter | . ; :), gated by a lookahead requiring at
+# least one street/ward/district keyword to appear somewhere before that
+# province name — without the lookahead, a bare "... tại Hà Nội" mention
+# with no real address nearby would false-positive on the province name
+# alone. Captured span (group 1) is the whole matched address, not just
+# the province tail — verified against every real address chunk seen in
+# this project's own documents.
+_VN_ADDRESS_RE = re.compile(
+    r"(?:^|[|.;:\n])\s*"
+    r"(?=[^|.;:\n]{0,120}?" + _VN_ADDRESS_KEYWORDS + r"[^|.;:\n]{0,120}?" + _VN_PROVINCES + r")"
+    r"([^|.;:\n]{0,120}?" + _VN_PROVINCES + r")",
+    re.IGNORECASE,
+)
+_ADDRESS_LABEL_RE = re.compile(r"address", re.IGNORECASE)
 
 # No regex-detected "money" type anymore — deliberately not in
 # REGEX_PATTERNS, so Layer 1 never emits a "money" entity on its own.
@@ -271,28 +331,200 @@ def invalidate_label_cache() -> None:
     _cache_source = None
 
 
-# ── GLiNER lazy loader ────────────────────────────────────────────────────────
+# ── GLiNER2 lazy loader ───────────────────────────────────────────────────────
 
 _gliner_model = None
 _gliner_lock  = threading.Lock()
 
 
-# Lazily load and cache the GLiNER model; returns None if loading fails.
+# Lazily load and cache the GLiNER2 model; returns None if loading fails.
+# Only actually loaded the first time it's needed — if
+# "entity_extraction.use_llm" stays on for the life of the process, this
+# never gets called and no GLiNER2 weights are loaded into memory at all.
 def _get_gliner():
     global _gliner_model
     if _gliner_model is None:
         with _gliner_lock:
             if _gliner_model is None:
                 try:
-                    from gliner import GLiNER
+                    from gliner2 import GLiNER2
                     from app.core.config import settings
-                    logger.info("Loading GLiNER model %s ...", settings.gliner_model_name)
-                    _gliner_model = GLiNER.from_pretrained(settings.gliner_model_name)
-                    logger.info("GLiNER model loaded.")
+                    logger.info("Loading GLiNER2 model %s ...", settings.gliner_model_name)
+                    _gliner_model = GLiNER2.from_pretrained(settings.gliner_model_name)
+                    logger.info("GLiNER2 model loaded.")
                 except Exception as exc:
-                    logger.error("Failed to load GLiNER: %s", exc)
+                    logger.error("Failed to load GLiNER2: %s", exc)
                     _gliner_model = None
     return _gliner_model
+
+
+# Read the "entity_extraction.use_llm" system setting (default False —
+# see system_setting_repository.DEFAULTS). Fails closed to GLiNER2 (False)
+# on any error, since GLiNER2 is the cheap/local/always-available path.
+def _use_llm_for_entities(db) -> bool:
+    if db is None:
+        return False
+    try:
+        from app.repositories.system_setting_repository import system_setting_repository
+        return bool(system_setting_repository.get(db, "entity_extraction.use_llm"))
+    except Exception:
+        return False
+
+
+# Real batched forward pass — model.batch_extract_entities() encodes every
+# text in the group through the encoder in one pass (DataLoader-based),
+# not once per text. Measured ~2.3x faster than looping extract_entities()
+# per text (12-text batch, CPU). Output is nested by label per text
+# ({"entities": {label: [{"text","confidence","start","end"}]}}), unlike
+# the old `gliner` package's flat list — flatten each to the same
+# {"text","label","start","end","score","source"} shape every caller in
+# this module already expects, so nothing downstream has to change.
+#
+# One try/except around the whole batch, not per-text: a real single-pass
+# call fails or succeeds as a unit (eg OOM, corrupt state), so partial
+# per-text recovery isn't meaningful here — same fail-open contract as
+# every other engine in this module, just applied to the group as a whole.
+def _gliner2_predict(model, texts: list[str], labels: list[str], threshold: float) -> list[list[dict]]:
+    gliner_prompts = [_to_gliner_prompt(label) for label in labels]
+    try:
+        raw_results = model.batch_extract_entities(
+            texts, gliner_prompts, batch_size=max(1, len(texts)), threshold=threshold,
+            include_confidence=True, include_spans=True,
+        )
+    except Exception as exc:
+        logger.error("GLiNER2 batch inference error: %s", exc)
+        return [[] for _ in texts]
+
+    results: list[list[dict]] = []
+    for raw in raw_results:
+        entities: list[dict] = []
+        for label, items in (raw.get("entities") or {}).items():
+            for item in items or []:
+                entities.append({
+                    "text": item.get("text"),
+                    "label": _from_gliner_prompt(label),
+                    "start": item.get("start"),
+                    "end": item.get("end"),
+                    "score": item.get("confidence", 0.0),
+                    "source": "gliner",
+                })
+        results.append(entities)
+    return results
+
+
+_ENTITY_LLM_SYSTEM_PROMPT = (
+    "Bạn là hệ thống nhận diện thực thể (named entity recognition) trong văn bản "
+    "doanh nghiệp tiếng Việt. Chỉ trả về JSON, không kèm giải thích."
+)
+
+
+def _build_entity_llm_prompt(texts: list[str], labels: list[str]) -> str:
+    label_list = "\n".join(f"- {label}" for label in labels)
+    chunks_block = "\n\n".join(
+        f'<chunk id="{i}">\n{text}\n</chunk>' for i, text in enumerate(texts)
+    )
+    return (
+        "Danh sách loại thực thể cần tìm (entity_key):\n"
+        f"{label_list}\n\n"
+        "Với MỖI đoạn văn bản dưới đây, tìm mọi cụm từ khớp với 1 trong các "
+        "entity_key trên. Chỉ trả về entity thực sự xuất hiện NGUYÊN VĂN trong "
+        "đoạn văn bản đó (copy chính xác từng ký tự, không diễn giải/rút gọn/dịch), "
+        "vì hệ thống sẽ tự tìm lại vị trí bằng cách so khớp chuỗi con nguyên văn.\n\n"
+        f"{chunks_block}\n\n"
+        "Trả về đúng JSON theo dạng sau, không kèm gì khác:\n"
+        '{"chunks": [{"chunk_id": "<id đúng như trong thẻ chunk>", '
+        '"entities": [{"entity_key": "<entity_key nguyên văn>", "text": "<cụm từ nguyên văn trong đoạn>"}]}]}'
+    )
+
+
+# Alternative to GLiNER2: ask the configured LLM to find entities instead,
+# gated by the "entity_extraction.use_llm" system setting. Mirrors the
+# fail-open JSON-prompt pattern already used by
+# entity_policy_service._select_relevant_labels() (llm_service.generate_json
+# with use_default_instructions=False, temperature=0.0, wrapped try/except).
+#
+# The LLM is deliberately NEVER asked for character offsets — models are
+# unreliable at counting characters, and a wrong span would mask/reveal the
+# wrong text. Instead it must copy the matched text verbatim, and this
+# function locates the real start/end itself via a literal substring search
+# on the original chunk. If the LLM's text doesn't appear verbatim, that
+# entity is dropped rather than guessed at.
+def _extract_via_llm(texts: list[str], labels: list[str], threshold: float) -> list[list[dict]]:
+    empty: list[list[dict]] = [[] for _ in texts]
+    if not texts or not labels:
+        return empty
+
+    from app.services.llm_service import llm_service
+
+    if not llm_service.is_configured():
+        return empty
+
+    prompt = _build_entity_llm_prompt(texts, labels)
+    try:
+        text_json, _, _ = llm_service.generate_json(
+            prompt,
+            system=_ENTITY_LLM_SYSTEM_PROMPT,
+            use_default_instructions=False,
+            temperature=0.0,
+        )
+        data = json.loads(text_json)
+    except Exception:
+        logger.warning(
+            "[entity-extractor] LLM entity detection failed, returning no entities",
+            exc_info=True,
+        )
+        return empty
+
+    allowed_labels = set(labels)
+    results: list[list[dict]] = [[] for _ in texts]
+    for item in data.get("chunks") or []:
+        if not isinstance(item, dict):
+            continue
+        try:
+            idx = int(item.get("chunk_id"))
+        except (TypeError, ValueError):
+            continue
+        if idx < 0 or idx >= len(texts):
+            continue
+        original = texts[idx]
+        entities: list[dict] = []
+        for raw_entity in item.get("entities") or []:
+            if not isinstance(raw_entity, dict):
+                continue
+            label = str(raw_entity.get("entity_key") or "")
+            value = str(raw_entity.get("text") or "")
+            if not label or not value or label not in allowed_labels:
+                continue
+            start = original.find(value)
+            if start < 0:
+                continue  # LLM didn't copy the span verbatim - unsafe to guess an offset
+            entities.append({
+                "text": value,
+                "label": label,
+                "start": start,
+                "end": start + len(value),
+                "score": 0.95,  # LLM has no real confidence score to report
+                "source": "llm",
+            })
+        results[idx] = entities
+    return results
+
+
+# Single choke point for "detect entities in these texts": routes to the LLM
+# path or the GLiNER2 path based on the "entity_extraction.use_llm" system
+# setting. Both paths return the identical flat shape, so every caller below
+# stays agnostic to which one actually ran.
+def _detect_entities_batch(
+    texts: list[str], labels: list[str], threshold: float, db=None,
+) -> list[list[dict]]:
+    if not texts or not labels:
+        return [[] for _ in texts]
+    if _use_llm_for_entities(db):
+        return _extract_via_llm(texts, labels, threshold)
+    model = _get_gliner()
+    if model is None:
+        return [[] for _ in texts]
+    return _gliner2_predict(model, texts, labels, threshold)
 
 
 # ── Layer 1: Regex extraction ─────────────────────────────────────────────────
@@ -313,6 +545,25 @@ def extract_structured_entities(text: str, allowed_labels: set[str] | None = Non
                 "score":  1.0,
                 "source": "regex",
             })
+
+    # VN address regex fallback (see _VN_ADDRESS_RE) — applies to every
+    # active label whose entity_key names it an address, not just one
+    # hardcoded key. Requires allowed_labels because a matched span needs
+    # a concrete label to be emitted under; with no restriction given
+    # there's no way to know which address-type key(s) are even active.
+    if allowed_labels:
+        for label in allowed_labels:
+            if not _ADDRESS_LABEL_RE.search(label):
+                continue
+            for m in _VN_ADDRESS_RE.finditer(text):
+                results.append({
+                    "text":   m.group(1),
+                    "label":  label,
+                    "start":  m.start(1),
+                    "end":    m.end(1),
+                    "score":  1.0,
+                    "source": "regex",
+                })
     return results
 
 
@@ -333,28 +584,21 @@ def _from_gliner_prompt(label: str) -> str:
     return label.replace(" ", "_")
 
 
-# Extract free-text entities using GLiNER with the given label list (Layer 2).
-# Money-hint annotated (see _annotate_bare_money) so ingest-time detection
-# (run_pipeline) gets the same VNĐ-context boost as query-time — without
-# this, removing the regex "money" pattern would leave ingest-time
-# chunk_sensitivity scoring blind to bare numeric amounts entirely.
-def extract_freetext_entities(text: str, labels: list[str], threshold: float = 0.3) -> list[dict]:
+# Extract free-text entities (GLiNER2 or LLM — see _detect_entities_batch)
+# for the given label list (Layer 2). Money-hint annotated (see
+# _annotate_bare_money) so ingest-time detection (run_pipeline) gets the
+# same VNĐ-context boost as query-time — without this, removing the regex
+# "money" pattern would leave ingest-time chunk_sensitivity scoring blind
+# to bare numeric amounts entirely.
+def extract_freetext_entities(text: str, labels: list[str], threshold: float = 0.3, db=None) -> list[dict]:
     if not labels:
         return []
-    model = _get_gliner()
-    if model is None:
-        return []
     annotated, insertions = _annotate_bare_money(text)
-    try:
-        raw = model.predict_entities(annotated, [_to_gliner_prompt(l) for l in labels], threshold=threshold)
-        for e in raw:
-            e["label"] = _from_gliner_prompt(e["label"])
-            e["source"] = "gliner"
-            _remap_entity_span(e, insertions, text)
-        return raw
-    except Exception as exc:
-        logger.error("GLiNER inference error: %s", exc)
-        return []
+    batched = _detect_entities_batch([annotated], labels, threshold, db=db)
+    entities = batched[0] if batched else []
+    for e in entities:
+        _remap_entity_span(e, insertions, text)
+    return entities
 
 
 # ── Layer 3: Boolean labels ───────────────────────────────────────────────────
@@ -388,7 +632,7 @@ def detect_boolean_labels(
 
 # ── Realtime extraction (retrieval time) ──────────────────────────────────────
 
-# Run GLiNER on a single text. Returns (entities, detected_entity_types).
+# Run entity detection on a single text. Returns (entities, detected_entity_types).
 def extract_realtime(
     text: str,
     *,
@@ -396,27 +640,21 @@ def extract_realtime(
     threshold: float = 0.3,
 ) -> tuple[list[dict], set[str]]:
     gliner_labels, _ = _refresh_cache(db)
-    entities = extract_freetext_entities(text, gliner_labels, threshold=threshold)
+    entities = extract_freetext_entities(text, gliner_labels, threshold=threshold, db=db)
     return entities, {e["label"] for e in entities}
 
 
-# Run GLiNER's own batched inference() over ALL texts in a single forward
-# pass, instead of one model call per text. predict_entities(text, ...) is
-# just inference([text], ...)[0] under the hood — calling it once per chunk
-# pays the full per-call overhead (tokenize/collate/eval/dispatch) N times
-# instead of once, which is what made detection latency scale linearly with
-# top_k. Falls back to per-text predict_entities if the installed gliner
-# version lacks inference() (older releases only expose predict_entities).
-def _batch_predict(model, texts: list[str], labels: list[str], threshold: float) -> list[list[dict]]:
-    gliner_prompts = [_to_gliner_prompt(label) for label in labels]
-    if hasattr(model, "inference"):
-        batched = model.inference(texts, gliner_prompts, threshold=threshold, batch_size=max(1, len(texts)))
-    else:
-        batched = [model.predict_entities(text, gliner_prompts, threshold=threshold) for text in texts]
-    for entities in batched:
-        for e in entities:
-            e["label"] = _from_gliner_prompt(e["label"])
-    return batched
+# Thin wrapper kept for its name/callers below (extract_realtime_batch,
+# extract_realtime_batch_detailed) — the actual GLiNER2-vs-LLM routing lives
+# in _detect_entities_batch. Kept as a separate function (rather than
+# inlining) because callers group texts by per_text_labels first (see
+# _group_by_labels/_MAX_LABEL_GROUPS below) and call this once per group,
+# so one call here still corresponds to "one batch of texts sharing a label
+# set", regardless of which underlying engine handles it.
+def _batch_predict(
+    texts: list[str], labels: list[str], threshold: float, db=None,
+) -> list[list[dict]]:
+    return _detect_entities_batch(texts, labels, threshold, db=db)
 
 
 # Cap on distinct per-text label subsets extract_realtime_batch_detailed will
@@ -448,8 +686,8 @@ def _group_by_labels(per_text_labels: list[list[str]]) -> list[tuple[list[str], 
     return [(list(key), indices) for key, indices in groups.items()]
 
 
-# Run GLiNER on multiple texts in one batched forward pass.
-# Returns one set[str] of detected entity types per text.
+# Run entity detection on multiple texts in one batch (GLiNER2 or LLM — see
+# _detect_entities_batch). Returns one set[str] of detected entity types per text.
 def extract_realtime_batch(
     texts: list[str],
     *,
@@ -461,15 +699,12 @@ def extract_realtime_batch(
     gliner_labels, _ = _refresh_cache(db)
     if not gliner_labels:
         return [set() for _ in texts]
-    model = _get_gliner()
-    if model is None:
-        return [set() for _ in texts]
 
     try:
-        batched = _batch_predict(model, texts, gliner_labels, threshold)
+        batched = _batch_predict(texts, gliner_labels, threshold, db=db)
         return [{e["label"] for e in raw} for raw in batched]
     except Exception as exc:
-        logger.error("GLiNER batch inference error: %s", exc)
+        logger.error("Entity batch detection error: %s", exc)
         return [set() for _ in texts]
 
 
@@ -499,10 +734,9 @@ def extract_realtime_batch_detailed(
     gliner_labels, entity_flags = _refresh_cache(db) if labels is None else (
         sorted(set(labels)), _refresh_cache(db)[1]
     )
-    model = _get_gliner() if gliner_labels else None
     allowed_labels = set(gliner_labels)
 
-    # Annotated-for-GLiNER copies only — never used for regex, never
+    # Annotated-for-GLiNER2 copies only — never used for regex, never
     # returned/stored (see _annotate_bare_money's docstring above).
     annotated_texts: list[str] = []
     insertions_by_text: list[list[tuple[int, int]]] = []
@@ -511,35 +745,36 @@ def extract_realtime_batch_detailed(
         annotated_texts.append(annotated)
         insertions_by_text.append(insertions)
 
-    # One batched GLiNER call across all chunks (see _batch_predict), then a
-    # cheap per-text loop for regex extraction + assembly.
+    # One batched call per label-group across all chunks (see
+    # _batch_predict/_detect_entities_batch — GLiNER2 or LLM depending on
+    # the entity_extraction.use_llm setting), then a cheap per-text loop for
+    # regex extraction + assembly. entity["source"] is already set correctly
+    # ("gliner" or "llm") by whichever engine actually ran.
     freetext_by_text: list[list[dict]] = [[] for _ in texts]
-    if model is not None:
+    if gliner_labels:
         try:
             if per_text_labels is not None and len(per_text_labels) == len(texts):
                 for group_labels, indices in _group_by_labels(per_text_labels):
                     # A per-text subset may reference labels that are no
                     # longer active/valid (eg from a stale LLM suggestion) —
-                    # clip to what GLiNER is actually allowed to look for.
+                    # clip to what this run is actually allowed to look for.
                     group_labels = [label for label in group_labels if label in allowed_labels]
                     if not group_labels:
                         continue
                     group_texts = [annotated_texts[i] for i in indices]
-                    batched = _batch_predict(model, group_texts, group_labels, threshold)
+                    batched = _batch_predict(group_texts, group_labels, threshold, db=db)
                     for i, freetext in zip(indices, batched):
                         for entity in freetext:
-                            entity["source"] = "gliner"
                             _remap_entity_span(entity, insertions_by_text[i], texts[i])
                         freetext_by_text[i] = freetext
             else:
-                batched = _batch_predict(model, annotated_texts, gliner_labels, threshold)
+                batched = _batch_predict(annotated_texts, gliner_labels, threshold, db=db)
                 for i, freetext in enumerate(batched):
                     for entity in freetext:
-                        entity["source"] = "gliner"
                         _remap_entity_span(entity, insertions_by_text[i], texts[i])
                     freetext_by_text[i] = freetext
         except Exception as exc:
-            logger.debug("GLiNER batched detailed extraction failed: %s", exc)
+            logger.debug("Entity batched detailed extraction failed: %s", exc)
 
     results: list[dict] = []
     for text, freetext in zip(texts, freetext_by_text):
@@ -568,7 +803,7 @@ def run_pipeline(
     gliner_labels, entity_flags = _refresh_cache(db)
 
     structured = extract_structured_entities(text, set(gliner_labels))
-    freetext   = extract_freetext_entities(text, gliner_labels, threshold=gliner_threshold)
+    freetext   = extract_freetext_entities(text, gliner_labels, threshold=gliner_threshold, db=db)
     all_entities = structured + freetext
 
     booleans = detect_boolean_labels(text, all_entities, entity_flags)

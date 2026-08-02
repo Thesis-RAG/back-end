@@ -15,6 +15,7 @@ logger = logging.getLogger(__name__)
 from app.models.document_entity_action import DocumentEntityAction
 from app.models.document_version import DocumentVersion
 from app.repositories.document_entity_repository import document_entity_repository
+from app.repositories.system_setting_repository import system_setting_repository
 from app.services.entity_extractor import extract_realtime_batch_detailed, run_pipeline
 from app.services.parser_service import parser_service
 from app.services.policy_rule_service import (
@@ -206,7 +207,13 @@ def _tidy_masked_table_rows(text: str) -> str:
 # that chunk — identical to the behavior before this feature existed. This
 # is a precision layer, not a security gate; resolve_tier()'s block-by-
 # default fallback still runs on whatever GLiNER ends up finding either way.
-ENTITY_LABEL_LLM_FILTER_ENABLED = True
+#
+# Only meaningful when the detect engine is GLiNER (entity_extraction.use_llm
+# is False) — when it's the LLM instead, that single call already sees the
+# full label list and every chunk at once, so pre-filtering labels first
+# would just be a second, redundant LLM round-trip. Toggle at runtime via
+# the "entity_extraction.label_prefilter_enabled" system setting (see
+# apply_to_retrieved below); no hardcoded on/off switch here anymore.
 
 # Only used to judge topical relevance, not to find exact spans — no need
 # for the full chunk text, and keeping this small bounds prompt size across
@@ -574,37 +581,68 @@ class EntityPolicyService:
 
         query_entities = self.query_entities(query, db)
 
-        # Narrow GLiNER's per-chunk active label set via one LLM call for
-        # the whole batch (see _select_relevant_labels above). Any chunk the
-        # LLM didn't return, or any failure of the call itself, keeps the
-        # full active label list for that chunk — same as before this step
-        # existed, so this can never cause LESS detection than the baseline.
+        # One graph round-trip per chat turn, reused below both to narrow
+        # the detection label set to this user's own permissions and, later,
+        # to resolve each detected entity's tier per chunk — see
+        # expand_oui_ids_via_graph's docstring for why this can't just be an
+        # exact match on the user's own OUI.
+        expanded_oui_ids = expand_oui_ids_via_graph(user)
+
+        # An entity_key that resolves "full" (allowed) for THIS user is pure
+        # waste to detect — nothing gets masked/blocked from it, it only
+        # adds latency/noise to the GLiNER or LLM call. Narrow the label set
+        # up front to entity_keys that would actually resolve "require" or
+        # "block" for this user. This has to be computed per-request (not
+        # cached globally) because allow_scope_pairs is user-specific — eg
+        # an HR head may see "salary" resolve "full" while everyone else
+        # sees "require" for the exact same rule. A user allowed on every
+        # active rule (eg clearance 5) ends up with an empty label set, so
+        # detection is skipped entirely for them below.
+        active_rules = policy_rule_service.active_rules(db, DEFAULT_POLICY_PROFILE)
+        permitted_rules = {
+            rule.entity_key: rule
+            for rule in active_rules
+            if resolve_tier(rule, user, expanded_oui_ids)["tier"] != "full"
+        }
+        permitted_labels = list(permitted_rules)
+
+        # Narrow GLiNER's per-chunk active label set further via one LLM
+        # call for the whole batch (see _select_relevant_labels above), on
+        # top of the permission filter above. Any chunk the LLM didn't
+        # return, or any failure of the call itself, keeps the full
+        # permitted label list for that chunk — same as before this step
+        # existed, so this can never cause LESS detection than the
+        # permission-filtered baseline.
+        #
+        # Skipped entirely when the detect engine itself is the LLM
+        # (entity_extraction.use_llm) — that call already sees every label
+        # and chunk at once, so pre-filtering first would just be a second,
+        # redundant LLM round-trip for no benefit. Also skipped when the
+        # permission filter above already emptied the label set — nothing
+        # left to narrow.
         per_text_labels = None
-        if ENTITY_LABEL_LLM_FILTER_ENABLED:
-            active_rules = policy_rule_service.active_rules(db, DEFAULT_POLICY_PROFILE)
-            all_labels = {rule.entity_key: rule.display_name for rule in active_rules}
+        use_llm_detect = bool(system_setting_repository.get(db, "entity_extraction.use_llm"))
+        if permitted_labels and not use_llm_detect and system_setting_repository.get(db, "entity_extraction.label_prefilter_enabled"):
+            all_labels = {key: rule.display_name for key, rule in permitted_rules.items()}
             per_chunk_labels = _select_relevant_labels(chunks, all_labels)
             _log_label_filter_result(chunks, all_labels, per_chunk_labels)
             if per_chunk_labels:
-                full_label_list = list(all_labels)
                 per_text_labels = [
-                    per_chunk_labels.get(str(chunk.get("chunk_id") or ""), full_label_list)
+                    per_chunk_labels.get(str(chunk.get("chunk_id") or ""), permitted_labels)
                     for chunk in chunks
                 ]
 
         # Always detect against the LIVE central policy label set (no frozen
-        # per-chunk snapshot) — a label added today must apply to documents
-        # ingested long before it existed, without any reprocessing step.
+        # per-chunk snapshot), narrowed to this user's permitted labels — a
+        # label added today must apply to documents ingested long before it
+        # existed, without any reprocessing step.
         details = extract_realtime_batch_detailed(
             [str(chunk.get("document_text") or "") for chunk in chunks], db=db,
+            labels=permitted_labels,
             per_text_labels=per_text_labels,
         )
         processed: list[dict] = []
         contracts: list[dict] = []
-        # One graph round-trip per chat turn, reused for every chunk/entity
-        # below — see expand_oui_ids_via_graph's docstring for why this
-        # can't just be an exact match on the user's own OUI.
-        expanded_oui_ids = expand_oui_ids_via_graph(user)
 
         for chunk, detail in zip(chunks, details):
             result = dict(chunk)

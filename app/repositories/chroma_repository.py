@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import threading
 import unicodedata
 from typing import Any
@@ -22,14 +23,28 @@ try:
 except ImportError:
     ViTokenizer = None
 
-# Vietnamese stopwords filtered out before keyword tokenisation.
+# Vietnamese stopwords filtered out before keyword tokenisation. Includes
+# both generic function words and interrogative-phrase words ("là gì",
+# "thế nào", "ở đâu", ...) — a question word carries no BM25 matching
+# value of its own (every document and every question contains some of
+# them), so leaving them in only dilutes term-frequency signal for the
+# words that actually distinguish one query from another.
 _VN_STOPWORDS = {
     "là", "của", "và", "có", "được", "này", "đó", "các", "cho", "với",
     "tại", "về", "như", "từ", "trong", "khi", "để", "theo", "những",
     "một", "đã", "sẽ", "thì", "mà", "hay", "hoặc", "nên", "vì", "do",
     "bị", "bởi", "ra", "vào", "lên", "xuống", "đang", "rất", "cũng",
     "không", "còn", "nữa", "nào", "gì", "ai", "sao", "bao", "nhiêu",
+    "thế", "ở", "đâu", "vậy", "à", "ư", "nhé", "nhỉ",
 }
+
+# Stripped from both ends of every token after segmentation — punctuation
+# left attached (eg a trailing "?" glued onto the last word of a question:
+# "An?") makes that token match nothing in the corpus even when the bare
+# word appears there, silently zeroing out that word's entire contribution
+# to BM25 scoring. \W with Unicode strings already treats Vietnamese
+# diacritic letters as word characters, so this only strips true punctuation.
+_PUNCT_STRIP_RE = re.compile(r"^\W+|\W+$", re.UNICODE)
 
 
 # Remove Vietnamese diacritics and normalise to ASCII for accent-insensitive comparison.
@@ -40,13 +55,18 @@ def _strip_accents(text: str) -> str:
 
 
 # Tokenise Vietnamese text using pyvi when available, falling back to whitespace split.
+# Every token has leading/trailing punctuation stripped (see _PUNCT_STRIP_RE)
+# so a token glued to sentence punctuation ("An?", "công_ty,") still matches
+# the same word appearing cleanly elsewhere in the corpus.
 def _segment_vi(text: str) -> list[str]:
     text = (text or "").strip().lower()
     if not text:
         return []
     if ViTokenizer is not None:
-        return [t.replace("_", " ") for t in ViTokenizer.tokenize(text).split()]
-    return text.split()
+        raw_tokens = [t.replace("_", " ") for t in ViTokenizer.tokenize(text).split()]
+    else:
+        raw_tokens = text.split()
+    return [t for t in (_PUNCT_STRIP_RE.sub("", tok) for tok in raw_tokens) if t]
 
 
 class ChromaRepository:

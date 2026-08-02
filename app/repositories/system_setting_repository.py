@@ -17,11 +17,18 @@ DEFAULTS: dict[str, Any] = {
     "rag.similarity_threshold": 0.0,
     "rag.hybrid_search": True,
     "rag.rerank_enabled": True,
-    "query_scope_mode": "full_db",
     "llm.provider": None,
     "llm.chat_model": None,
     "llm.reasoning_effort": "medium",
     "llm.embedding_model": None,
+    # False = nhận diện thực thể (Layer 2) dùng GLiNER cục bộ (nhanh, miễn phí).
+    # True = đưa từng chunk cho LLM nhận diện thực thể thay vì GLiNER.
+    "entity_extraction.use_llm": False,
+    # Chỉ có ý nghĩa khi entity_extraction.use_llm = False (engine detect là
+    # GLiNER). True = trước khi GLiNER detect, LLM lọc trước danh sách nhãn
+    # liên quan cho từng chunk (query-time only) để thu hẹp label list.
+    # False = GLiNER tự detect trên toàn bộ label list, không gọi LLM.
+    "entity_extraction.label_prefilter_enabled": True,
 }
 
 

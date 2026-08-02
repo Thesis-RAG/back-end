@@ -218,14 +218,17 @@ def view_document_file(
     db: Session = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ):
-    document_service.get_document(db, current_user, document_id)
+    doc = document_service.get_document(db, current_user, document_id)
 
-    # Chunk-level sensitivity gate: block if any chunk > user clearance without approval
+    # Chunk-level sensitivity gate: block if any chunk > user clearance without approval.
+    # Owners are exempt — matches /access-status (the lock icon), so a doc
+    # never shows "unlocked" for its owner while still 403-ing them here.
     user_clearance = max(
         (uop.position.clearance for uop in getattr(current_user, "oui_positions", []) if uop.position),
         default=1,
     )
-    if not _is_corp_member(db, current_user):
+    is_owner = doc.owner_user_id == current_user.id
+    if not _is_corp_member(db, current_user) and not is_owner:
         # Read from Chroma — same source as /access-status (the lock icon) so both
         # always agree. Legacy-ingested chunks lack chunk_sensitivity in MySQL.
         from app.services.chroma_service import chroma_service

@@ -4,7 +4,7 @@ with FGA permission gating and chunk-level sensitivity filtering.
 """
 from __future__ import annotations
 from rank_bm25 import BM25Okapi
-from app.repositories.chroma_repository import ChromaRepository, _segment_vi
+from app.repositories.chroma_repository import ChromaRepository, _segment_vi, _VN_STOPWORDS
 
 import logging
 import math
@@ -125,10 +125,19 @@ class RetrievalService:
             if not ids:
                 return []
 
+            # Stopwords (generic function words + interrogative-phrase words
+            # like "là", "gì", "thế", "nào" — see _VN_STOPWORDS) are dropped
+            # from both corpus and query tokens: they carry no distinguishing
+            # BM25 signal (nearly every Vietnamese sentence/question contains
+            # some), so keeping them just dilutes term-frequency weight away
+            # from the words that actually identify what's being asked.
+            # `or tokens` keeps the un-filtered list if stripping stopwords
+            # would empty it out entirely (eg a doc/query that's ALL filler).
             tokenized_corpus = []
             valid_idx = []
             for i, doc in enumerate(docs):
                 tokens = [t for t in _segment_vi(str(doc or "")) if len(t) > 1]
+                tokens = [t for t in tokens if t not in _VN_STOPWORDS] or tokens
                 if tokens:
                     tokenized_corpus.append(tokens)
                     valid_idx.append(i)
@@ -138,6 +147,7 @@ class RetrievalService:
 
             bm25 = BM25Okapi(tokenized_corpus)
             query_tokens = [t for t in _segment_vi(query) if len(t) > 1]
+            query_tokens = [t for t in query_tokens if t not in _VN_STOPWORDS] or query_tokens
             if not query_tokens:
                 return []
 
@@ -259,16 +269,6 @@ class RetrievalService:
     # Build where clause for Chroma
     # ------------------------------------------------------------------
 
-    # Build a Chroma where-clause restricting results to allowed document IDs.
-    def _build_where(
-        self,
-        allowed_doc_ids: list[str] | None,
-        oui_ids: list[str] | None,
-    ) -> dict | None:
-        if allowed_doc_ids:
-            return {"document_id": {"$in": allowed_doc_ids}}
-        return None
-    
     # Post-filter results to keep only chunks whose document belongs to at least one requested OUI.
     def _post_filter_oui(
         self,
@@ -736,84 +736,81 @@ class RetrievalService:
             ).all()
             fga_allowed_ids.update(str(row[0]) for row in public_rows)
 
+        # ── Owned doc IDs ─────────────────────────────────────────────────
+        # A chunk from a document the user owns is always treated as if its
+        # chunk_sensitivity were MIN_SENSITIVITY: never blurred, never RWSS-
+        # penalized, never clearance-blocked — an owner shouldn't be locked
+        # out of (or scored down in) their own upload just because their
+        # personal clearance is lower than a chunk inside it. Matches the
+        # same owner exemption applied to the Documents-tab lock/file-view
+        # gate (documents.py view_document_file, document_access_requests.py
+        # get_document_access_status).
+        owned_doc_ids: set[str] = set()
+        if db is not None:
+            owned_rows = db.query(Document.id).filter(Document.owner_user_id == user.id).all()
+            owned_doc_ids = {str(row[0]) for row in owned_rows}
+
         # ── Approved access requests (per-doc, not expired) ─────────────
         approved_doc_ids: set[str] = set()
-        scope_mode = "full_db"
         if db is not None:
             from app.repositories.document_access_request_repository import doc_access_request_repo
-            from app.repositories.system_setting_repository import system_setting_repository
             approved_doc_ids = doc_access_request_repo.get_active_approved_doc_ids(db, str(user.id))
-            scope_mode = system_setting_repository.get(db, "query_scope_mode") or "full_db"
 
         # ── Chroma query scope ──────────────────────────────────────────
-        # full_db: query all Chroma (no doc_id filter).
-        # branch_only: query only docs in the user's OUI branch.
-        if scope_mode == "branch_only" and db is not None:
-            from app.services.oui_tree_service import oui_tree_service
-            branch_oui_ids = oui_tree_service.get_user_branch_oui_ids(db, user)
-            branch_doc_ids = oui_tree_service.get_doc_ids_for_oui_ids(db, branch_oui_ids)
-            query_doc_ids = list(fga_allowed_ids | branch_doc_ids)
-            where = self._build_where(query_doc_ids or None, oui_ids)
-            if not query_doc_ids:
-                return []
+        # Corpus = every chunk belonging to a document visible on the user's
+        # Documents tab (document_service.visible_document_ids — same rule
+        # the tab itself uses, so chat can never surface a document the user
+        # couldn't otherwise browse to) PLUS every chunk that is itself
+        # public, even inside an otherwise out-of-scope document (eg one
+        # public chunk living in a mostly-restricted doc). oui_ids (an
+        # explicit user-picked OUI narrowing, unrelated to this scope) is
+        # still applied afterwards via _post_filter_oui.
+        if db is not None:
+            from app.services.document_service import document_service
+            visible_doc_ids = document_service.visible_document_ids(db, user)
+            where = {
+                "$or": [
+                    {"document_id": {"$in": list(visible_doc_ids)}},
+                    {"chunk_sensitivity": {"$eq": MIN_SENSITIVITY}},
+                ]
+            } if visible_doc_ids else {"chunk_sensitivity": {"$eq": MIN_SENSITIVITY}}
         else:
-            # full_db: no filter — Chroma returns all.
-            where = None if not oui_ids else self._build_where(None, oui_ids)
+            where = None
 
-        semantic_list: list[dict] = []
-        lexical_list: list[dict] = []
-
-        if mode in ("semantic", "hybrid"):
+        # Semantic (network round-trip to the embedding API) and lexical
+        # (local BM25 over the corpus) are fully independent — neither reads
+        # the other's output — so in hybrid mode they run concurrently
+        # instead of paying both latencies back-to-back. Measured: embedding
+        # call ~0.2-1s (network-bound), BM25 ~0.1-0.15s (CPU-bound); running
+        # them together costs roughly max(embed, bm25) instead of their sum.
+        def _run_semantic() -> list[dict]:
             emb = embedding_service.embed(query)
             raw = self.repo.query_by_embedding(
                 embedding=emb, top_k=self.semantic_candidates, where=where,
             )
-            semantic_list = self._parse_chroma(raw)
-            
-            # print("========== TOP SEMANTIC ==========")
-            # logger.info("========== TOP SEMANTIC ==========")
+            return self._parse_chroma(raw)
 
-            for idx, r in enumerate(semantic_list[:5], start=1):
-                md = r.get("metadata", {})
-
-                # print(
-                #     "[SEM %d] distance=%.6f heading=%s chunk=%s",
-                #     idx,
-                #     float(r.get("distance") or 999),
-                #     md.get("section_heading"),
-                #     r.get("chunk_id"),
-                # )
-
-                # print(
-                #     "[SEM %d TEXT] %s",
-                #     idx,
-                #     (r.get("document_text") or ""),
-                # )
-
-        if mode in ("keyword", "hybrid"):
-            lexical_list = self._bm25_search(
+        def _run_lexical() -> list[dict]:
+            return self._bm25_search(
                 query=query, top_k=self.lexical_candidates, where=where,
             )
-            
-            # print("========== TOP LEXICAL ==========")
-            # logger.info("========== TOP LEXICAL ==========")
 
-            for idx, r in enumerate(lexical_list[:5], start=1):
-                md = r.get("metadata", {})
+        need_semantic = mode in ("semantic", "hybrid")
+        need_lexical  = mode in ("keyword", "hybrid")
 
-                # print(
-                #     "[LEX %d] distance=%.6f heading=%s chunk=%s",
-                #     idx,
-                #     float(r.get("distance") or 999),
-                #     md.get("section_heading"),
-                #     r.get("chunk_id"),
-                # )
+        semantic_list: list[dict] = []
+        lexical_list: list[dict] = []
 
-                # print(
-                #     "[LEX %d TEXT] %s",
-                #     idx,
-                #     (r.get("document_text") or "")[:300],
-                # )
+        if need_semantic and need_lexical:
+            with ThreadPoolExecutor(max_workers=2) as executor:
+                semantic_future = executor.submit(_run_semantic)
+                lexical_future  = executor.submit(_run_lexical)
+                semantic_list = semantic_future.result()
+                lexical_list  = lexical_future.result()
+        elif need_semantic:
+            semantic_list = _run_semantic()
+        elif need_lexical:
+            lexical_list = _run_lexical()
 
         if not semantic_list and not lexical_list:
             return []
@@ -853,6 +850,14 @@ class RetrievalService:
         # FGA-allowed docs with chunks that exceed clearance and have no approval yet.
         # Pass 2 sets doc_restricted=True on all chunks of these docs so the frontend hides Eye/Plus.
         fga_has_blocked: set[str] = set()
+        # Computed once and reused below at the final rerank gate too — an
+        # over-clearance chunk only stays in `results` when RWSS is enabled,
+        # because only RWSS's clearance_penalty term has any mechanism to
+        # push it back down in rank. Without a reranker there is nothing
+        # downstream that acts on chunk_blurred (chat_service drops the flag
+        # before prompt-building), so keeping the chunk here would just ride
+        # it into the LLM context at full RRF rank — drop it outright instead.
+        rerank_enabled = self._is_rerank_enabled(db)
 
         for item in fused:
             sem = self._cosine_sim(item.get("semantic_distance")) if item.get("semantic_distance") is not None else None
@@ -865,7 +870,17 @@ class RetrievalService:
             doc_id   = meta.get("document_id", "")
             chunk_sens = int(meta.get("chunk_sensitivity") or meta.get("sensitivity") or 1)
 
-            fga_allow    = doc_id in fga_allowed_ids
+            is_owned = doc_id in owned_doc_ids
+            if is_owned:
+                # Override, not just bypass: the overridden value also has to
+                # land in `results[...]["metadata"]` so _rerank_after_rrf's
+                # _classify_chunk_sensitivity (which re-reads chunk_sensitivity
+                # from that stored metadata, not from this local variable)
+                # computes zero clearance_penalty for it too.
+                chunk_sens = MIN_SENSITIVITY
+                meta = {**meta, "chunk_sensitivity": MIN_SENSITIVITY}
+
+            fga_allow    = is_owned or (doc_id in fga_allowed_ids)
             has_approval = doc_id in approved_doc_ids
 
             if fga_allow:
@@ -874,6 +889,8 @@ class RetrievalService:
                 is_blurred = chunk_sens > user_clearance and not has_approval
                 if is_blurred:
                     fga_has_blocked.add(doc_id)
+                    if not rerank_enabled:
+                        continue
                 results.append({
                     "chunk_id":       item["chunk_id"],
                     "document_text":  item["document_text"],
@@ -913,7 +930,7 @@ class RetrievalService:
 
         # results is still in RRF-rank order here (post_filter_oui and
         # _verify_content_signatures only drop items, never reorder).
-        if self._is_rerank_enabled(db):
+        if rerank_enabled:
             rerank_pool = max(_RERANK_MIN_CANDIDATES, top_k * 2)
             results = results[:rerank_pool]
 

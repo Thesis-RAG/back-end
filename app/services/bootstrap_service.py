@@ -6,12 +6,13 @@ import logging
 from sqlalchemy.orm import Session
 
 from app.core.security import hash_password
+from app.models.entity_policy_rule import EntityPolicyRule
 from app.models.org_unit import OrgUnit
 from app.models.org_unit_instance import OrgUnitInstance
 from app.models.position import Position
 from app.models.user import User
 from app.models.user_oui_position import UserOuiPosition
-from app.services.policy_rule_service import policy_rule_service
+from app.services.policy_rule_service import DEFAULT_POLICY_PROFILE, policy_rule_service
 
 
 CORP_OU_NAME = "Công ty (Company)"
@@ -192,6 +193,24 @@ class BootstrapService:
         db.flush()
 
     def seed_defaults(self, db: Session) -> None:
+        # Bootstrap once, not "ensure present" on every container start —
+        # otherwise a default org unit / position / entity policy rule an
+        # admin deliberately deletes just comes back on the next restart.
+        # Once the baseline (a root OU + at least one default entity rule)
+        # exists, skip creating defaults; only a genuinely empty DB (fresh
+        # install) runs that part. _sync_user_memberships (FGA membership
+        # reconciliation) is a SEPARATE concern from "seeding" and always
+        # runs regardless — see the comment on its call near the bottom of
+        # the full-seed path below for why this matters.
+        root_exists = db.query(OrgUnit).filter(OrgUnit.parent_id.is_(None)).first() is not None
+        entities_exist = db.query(EntityPolicyRule).filter(
+            EntityPolicyRule.policy_profile == DEFAULT_POLICY_PROFILE
+        ).first() is not None
+        if root_exists and entities_exist:
+            logger.info("Bootstrap defaults already present — skipping default creation")
+            self._sync_user_memberships(db)
+            return
+
         # Reuse and normalize the first existing root when upgrading from the
         # previous English/minimal bootstrap.
         root = (
@@ -304,6 +323,16 @@ class BootstrapService:
             for old_parent_id in old_department_parent_ids.get(child.id, set()) - {management_oui.id}:
                 fga_adapter.unlink_oui_parent(child.id, old_parent_id)
             fga_adapter.link_oui_parent(child.id, management_oui.id)
+        # _sync_user_memberships writes each UserOuiPosition row's FGA
+        # `member` tuple. _ensure_user_assignment above only touched MySQL —
+        # it does NOT call fga_adapter.add_oui_member itself (unlike the
+        # org-unit-assignment API endpoint, which does) — so this call is
+        # the ONLY thing that ever grants the bootstrap-created admin (and
+        # any other assignment made outside the live API) their FGA access.
+        # Must also run on every later boot even once defaults already
+        # exist (see the early-return above) — OpenFGA's tuple store is a
+        # separate datastore (its own Postgres volume) that can drift out
+        # of sync with MySQL independently of anything seeded here.
         self._sync_user_memberships(db)
         logger.info(
             "Bootstrap reconciled root=%s root_oui=%s departments=%d",
