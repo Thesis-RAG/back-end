@@ -9,7 +9,7 @@ from collections import defaultdict
 from pathlib import Path
 
 from fastapi import HTTPException
-from sqlalchemy.orm import Session
+from sqlalchemy.orm import Session, joinedload, selectinload
 
 from app.core.config import settings
 from app.fga.adapter import fga_adapter
@@ -153,11 +153,28 @@ class DocumentService:
         return viewable_ids | public_ids | owned_ids
 
     # Return all documents the user may view via FGA grants, public status, and ownership.
+    #
+    # Eager-loads ouis/owner/current_version — DocumentRead.model_validate
+    # (app/schemas/document.py) reads all three per document. Without this,
+    # each was a separate lazy-load query PER document (N+1): ~190 visible
+    # documents x 3 relationships = ~570 sequential round-trips, the actual
+    # cause of the CPU spikes seen loading the Documents tab (both api and
+    # mysql containers spiking together — ORM object churn + query volume,
+    # not a single slow query).
     def list_documents(self, db: Session, user: User) -> list[Document]:
         ids = self.visible_document_ids(db, user)
         if not ids:
             return []
-        return db.query(Document).filter(Document.id.in_(ids)).all()
+        return (
+            db.query(Document)
+            .options(
+                selectinload(Document.ouis),
+                joinedload(Document.owner),
+                joinedload(Document.current_version),
+            )
+            .filter(Document.id.in_(ids))
+            .all()
+        )
 
     # Fetch a document by ID, raising 403/404 if missing or inaccessible.
     def get_document(self, db: Session, user: User, doc_id: str) -> Document:
