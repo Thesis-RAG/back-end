@@ -5,13 +5,18 @@ always scopes to the same document set the Documents tab shows (plus
 globally public chunks) — see app/services/document_service.py
 visible_document_ids and app/services/retrieval_service.py _retrieve_main.
 
-Revision ID: 022_drop_query_scope_mode_setting
+Revision ID: 022_drop_query_scope_mode
 Revises: 021_document_version_signature
 Create Date: 2026-08-02
 """
 from alembic import op
 
-revision = "022_drop_query_scope_mode_setting"
+# Kept <= 32 chars on purpose — alembic_version.version_num is VARCHAR(32)
+# by default, and MySQL strict mode rejects (rather than silently
+# truncates) an UPDATE that overflows it. "022_drop_query_scope_mode_setting"
+# (34 chars) hit exactly this, crash-looping the API on every startup with
+# no usable traceback until run standalone in the foreground.
+revision = "022_drop_query_scope_mode"
 down_revision = "021_document_version_signature"
 branch_labels = None
 depends_on = None
